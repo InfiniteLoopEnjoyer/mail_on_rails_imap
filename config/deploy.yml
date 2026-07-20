@@ -1,0 +1,66 @@
+<% require "dotenv"; Dotenv.load(".env") %>
+
+# The IMAP daemon as its own Kamal service, deployed independently of the
+# host Rails app: `bin/kamal deploy`. Runs bin/server with NO Rails
+# and NO database access at all: every mailbox operation goes to the app's
+# private HTTP API (one round-trip per IMAP store call - chatty, accepted
+# for the isolation). If the app is down, sessions report temporary
+# failures and clients retry.
+#
+# The container holds no RAILS_MASTER_KEY and no database credentials, so
+# it can't reach the app's database or decrypt its credentials even if
+# compromised.
+service: mail_on_rails_imap
+image: mail_on_rails_imap
+
+servers:
+  imap:
+    hosts:
+      - 192.168.0.1
+    # kamal-proxy only speaks HTTP/HTTPS - the listeners publish straight
+    # off the container (host port -> container port; in-container ports
+    # stay >1024 because the image runs as a non-root user). Kamal boots
+    # new before stopping old, which would clash on these ports, so
+    # .kamal/hooks/pre-app-boot stops the old container first (a few
+    # seconds of IMAP downtime per deploy; clients reconnect).
+    proxy: false
+    options:
+      publish:
+        - "143:1143"   # IMAP (STARTTLS)
+        - "993:1993"   # IMAPS (implicit TLS)
+
+primary_role: imap
+
+# Any registry both the build machine and the servers can reach; add
+# username/password entries (resolved via .kamal/secrets-common) if
+# yours requires auth.
+registry:
+  server: registry.example.com
+
+env:
+  secret:
+    # HTTP credential for the calls to the app, from the gitignored .env
+    # (see .kamal/secrets-common). Deliberately NO RAILS_MASTER_KEY and NO
+    # database env in this container.
+    - MAIL_ON_RAILS_INTERNAL_API_PASSWORD
+  clear:
+    # Every store operation goes to the app's private API.
+    MAIL_ON_RAILS_INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
+
+    # TLS material for the listeners (e.g. Let's Encrypt). Renewals are
+    # picked up live - the servers re-read the files when their mtimes
+    # change (TLS::ContextProvider), no restart needed.
+    MAIL_ON_RAILS_TLS_CERT: /etc/letsencrypt/live/mail.example.com/fullchain.pem
+    MAIL_ON_RAILS_TLS_KEY: /etc/letsencrypt/live/mail.example.com/privkey.pem
+
+aliases:
+  logs: app logs -f
+  shell: app exec --interactive --reuse "bash"
+
+volumes:
+  # Mounted at the letsencrypt root (not live/) because live/*.pem are
+  # symlinks into ../../archive/.
+  - "/etc/letsencrypt:/etc/letsencrypt:ro"
+
+builder:
+  arch: amd64

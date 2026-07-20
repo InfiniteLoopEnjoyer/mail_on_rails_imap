@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+# Kamal boots new containers before stopping old ones. This service
+# publishes host ports (143/993), so a new daemon can't bind while its
+# predecessor runs - stop the old one first. Costs a few seconds of IMAP
+# downtime per deploy (clients reconnect).
+
+[ "$KAMAL_SERVICE" = "mail_on_rails_imap" ] || exit 0
+
+IFS=',' read -ra HOSTS <<< "$KAMAL_HOSTS"
+for host in "${HOSTS[@]}"; do
+  ssh "root@$host" "docker ps -q --filter label=service=$KAMAL_SERVICE | xargs -r docker stop" \
+      && echo "Stopped old $KAMAL_SERVICE container on $host (freeing its ports)"
+done

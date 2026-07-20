@@ -1,0 +1,91 @@
+# frozen_string_literal: true
+
+require "logger"
+require_relative "../internal_api"
+
+module MailOnRails
+  module Imap
+    module Store
+      # The IMAP server's store, implemented entirely over HTTP - the daemon
+      # holds no database credentials. Every operation POSTs to the host
+      # app's private API (InternalApi), which delegates to the app's own
+      # store; raw message bytes are base64-framed both directions so
+      # arbitrary binary survives JSON.
+      #
+      # If the app is unreachable, operations degrade to the store
+      # contract's error envelope and the IMAP session reports a temporary
+      # failure (see Store::Contracts). One HTTP round-trip per store
+      # call - chatty for IMAP, accepted for the isolation.
+      class Http
+        def initialize(api: nil, logger: Logger.new($stdout))
+          @logger = logger
+          @api = api || InternalApi.new
+        end
+
+        def log(level, message)
+          @logger.public_send(level, "[mail_on_rails] #{message}")
+          nil
+        end
+
+        def authenticate(email, password)
+          wrap { @api.authenticate(email.to_s, password.to_s) }
+        end
+
+        def list_mailboxes(account_id)
+          op(:list_mailboxes, account_id: account_id)
+        end
+
+        def create_mailbox(account_id, name)
+          op(:create_mailbox, account_id: account_id, name: name)
+        end
+
+        def select_mailbox(account_id, name)
+          op(:select_mailbox, account_id: account_id, name: name)
+        end
+
+        def status(account_id, name)
+          op(:status, account_id: account_id, name: name)
+        end
+
+        def fetch(mailbox_id, uids, with_raw)
+          op(:fetch, mailbox_id: mailbox_id, uids: uids, with_raw: with_raw)
+        end
+
+        def store_flags(mailbox_id, uids, mode, flags)
+          op(:store_flags, mailbox_id: mailbox_id, uids: uids, mode: mode, flags: flags)
+        end
+
+        def expunge(mailbox_id)
+          op(:expunge, mailbox_id: mailbox_id)
+        end
+
+        def append(account_id, mailbox_name, raw, flags, internal_date_epoch)
+          op(:append, account_id: account_id, mailbox_name: mailbox_name,
+                      raw_base64: [ raw.to_s ].pack("m0"), flags: flags,
+                      internal_date_epoch: internal_date_epoch)
+        end
+
+        def copy(mailbox_id, uids, dest_name)
+          op(:copy, mailbox_id: mailbox_id, uids: uids, dest_name: dest_name)
+        end
+
+        private
+
+        def op(name, payload)
+          wrap { @api.imap_op(name, payload) }
+        end
+
+        # Mirrors the app-side stores' error envelope, without the database.
+        def wrap
+          yield
+        rescue InternalApi::Error => e
+          @logger.error("[mail_on_rails] store error: #{e.message}")
+          { error: e.message, code: e.code }
+        rescue StandardError => e
+          @logger.error("[mail_on_rails] store error: #{e.class}: #{e.message}")
+          { error: "#{e.class}: #{e.message}", code: :internal }
+        end
+      end
+    end
+  end
+end

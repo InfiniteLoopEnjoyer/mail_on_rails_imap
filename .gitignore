@@ -1,0 +1,12 @@
+# Secrets for config/deploy.yml / .kamal/secrets-common - never commit.
+/.env
+
+# Real production infrastructure (hosts, registry, domains) - the tracked
+# config/deploy.yml is a generic template. Deploy with -d prod.
+/config/deploy.prod.yml
+
+# Self-signed dev TLS material (regenerated on demand).
+/storage/tls/
+
+/.bundle/
+/tmp/
