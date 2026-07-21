@@ -4,8 +4,8 @@ require "mail_on_rails/imap/store/memory"
 
 # End-to-end IMAP session over a real loopback socket, backed by the
 # contract's reference store - no Rails, no database. The session is
-# constructed as an implicit-TLS listener would build it (tls_active:
-# true) so LOGIN is permitted on what is, here, a plain test socket.
+# constructed as an implicit-TLS listener would build it (spec tls:
+# :implicit) so LOGIN is permitted on what is, here, a plain test socket.
 class ImapSessionTest < Minitest::Test
   EMAIL = "user@example.test"
   PASSWORD = "pw-123456"
@@ -21,7 +21,7 @@ class ImapSessionTest < Minitest::Test
     server = TCPServer.new("127.0.0.1", 0)
     client = TCPSocket.new("127.0.0.1", server.addr[1])
     session_socket = server.accept
-    thread = Thread.new { MailOnRails::ImapServer::Session.new(session_socket, @store, nil, true).run }
+    thread = Thread.new { MailOnRails::ImapServer::Session.new(session_socket, @store, { tls: :implicit }, nil).run }
     yield client
   ensure
     client&.close

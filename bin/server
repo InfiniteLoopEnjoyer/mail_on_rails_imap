@@ -9,6 +9,11 @@
 require "bundler/setup"
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 
+# Worker Ractors and the fiber scheduler's IO::Buffer use both carry
+# experimental-API warnings; one line each at boot says nothing useful in
+# production logs.
+Warning[:experimental] = false
+
 require "mail_on_rails/imap/daemon"
 
 MailOnRails::Imap::Daemon.run!

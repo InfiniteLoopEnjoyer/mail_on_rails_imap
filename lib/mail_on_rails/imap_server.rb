@@ -35,9 +35,7 @@ module MailOnRails
 
     def listener_label(spec) = "#{spec[:port]}/#{spec[:tls]}"
 
-    def new_session(socket, spec, ctx)
-      Session.new(socket, @store, ctx, spec[:tls] == :implicit)
-    end
+    def session_class = Session
 
     # Splits a command line (with literals already inlined as separate
     # elements) into tokens: strings, :lparen and :rparen.
@@ -85,11 +83,12 @@ module MailOnRails
     class Session
       include Imap::SessionHelpers
 
-      def initialize(socket, store, tls_ctx, tls_active)
+      def initialize(socket, store, spec, tls_ctx)
         @socket = socket
         @store = store
+        @spec = spec
         @tls_ctx = tls_ctx
-        @tls = tls_active
+        @tls = spec[:tls] == :implicit
         @account_id = nil
         @auth_attempts = 0
         @selected = nil
@@ -473,10 +472,12 @@ module MailOnRails
 
       # -- FETCH ---------------------------------------------------------------
 
+      # Deep-frozen (not just the outer hash): session constants must be
+      # Ractor-shareable to be readable from worker Ractors.
       FETCH_MACROS = {
-        "ALL" => %w[FLAGS INTERNALDATE RFC822.SIZE ENVELOPE],
-        "FAST" => %w[FLAGS INTERNALDATE RFC822.SIZE],
-        "FULL" => %w[FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY]
+        "ALL" => %w[FLAGS INTERNALDATE RFC822.SIZE ENVELOPE].freeze,
+        "FAST" => %w[FLAGS INTERNALDATE RFC822.SIZE].freeze,
+        "FULL" => %w[FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY].freeze
       }.freeze
 
       METADATA_ITEMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE].freeze

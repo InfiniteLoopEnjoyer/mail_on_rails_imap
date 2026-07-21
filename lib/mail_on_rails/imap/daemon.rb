@@ -12,10 +12,13 @@ module MailOnRails
     # Used two ways:
     #
     #   - bin/server in this repo (`Daemon.run!`), the foreground process the
-    #     Kamal service runs - no Rails anywhere in the container
+    #     Kamal service runs - no Rails anywhere in the container. With the
+    #     default HTTP store this serves sessions from one worker Ractor per
+    #     core (see Imap::Server / Imap::Worker).
     #   - embedded in a host process via `Daemon.start` (e.g. a Rails app
     #     running the server inside Puma in development, passing its own
-    #     store/logger)
+    #     store/logger). An injected store keeps sessions on worker threads
+    #     in this process - Ractor workers can't share an in-process store.
     module Daemon
       module_function
 

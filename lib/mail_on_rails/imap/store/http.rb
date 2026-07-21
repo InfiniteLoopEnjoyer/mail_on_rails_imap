@@ -22,6 +22,20 @@ module MailOnRails
           @api = api || InternalApi.new
         end
 
+        # -- worker Ractor support ---------------------------------------------
+        # This store is an env-configured HTTP client plus a stdout logger, so
+        # each worker Ractor can simply build its own instance; #worker_config
+        # advertises that to Server (its presence selects Ractor mode) and
+        # .from_config performs the rebuild inside the worker.
+
+        def worker_config
+          { store_class: self.class }
+        end
+
+        def self.from_config(_config = {})
+          new(logger: Logger.new($stdout, progname: "mail_on_rails_imap"))
+        end
+
         def log(level, message)
           @logger.public_send(level, "[mail_on_rails] #{message}")
           nil

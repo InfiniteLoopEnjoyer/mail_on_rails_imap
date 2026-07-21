@@ -15,13 +15,41 @@ server. `Store::Memory` is the dependency-free reference implementation,
 `Store::Http` the production client, and `Store::Contracts` the
 executable (Minitest) spec a custom store must pass.
 
+## Concurrency architecture
+
+Sessions are served by a pool of **worker Ractors** (one per core by
+default), each running a single thread whose hand-rolled
+**fiber scheduler** (`Imap::Scheduler`, pure Ruby over `IO.select`)
+multiplexes every session on that worker: socket reads, TLS handshakes,
+and store HTTP calls park a fiber, never the thread. Accept threads stay
+in the main Ractor with the exact process-wide `ConnLimiter`; accepted
+sockets cross to workers as **raw fd numbers over a control pipe** (fds
+are process-global, and integer messages sidestep Ractor IO moves, which
+Ruby 4.0.6 does not handle reliably under a scheduler - probes documented
+in `scheduler.rb`/`worker.rb`). Finished sessions are reported back as
+single bytes on a shared release pipe.
+
+Ractor mode engages when the store can be rebuilt inside each worker
+(`Store::Http` can - it is an env-configured HTTP client). An injected
+store instance (tests, embedded development) falls back to the same
+worker/scheduler core on plain threads, so both modes exercise identical
+session code. Requires Ruby >= 4.0 in Ractor mode; Ractors are still
+formally experimental there.
+
+Companion repos:
+[mail_on_rails](https://github.com/InfiniteLoopEnjoyer/mail_on_rails)
+(the host Rails app — persistence, internal API, and web UI) and
+[mail_on_rails_smtp](https://github.com/InfiniteLoopEnjoyer/mail_on_rails_smtp)
+(the SMTP server).
+
 ## Layout
 
 - `lib/mail_on_rails/imap/` - the gem: listener scaffolding
-  (`Server`/`ConnLimiter`/`TLS`), the IMAP session (`ImapServer`), MIME
-  parsing, and stores (`Store::Memory` reference implementation,
-  `Store::Http` production client, `Store::Contracts` executable contract
-  suite).
+  (`Server`/`ConnLimiter`/`TLS`), the serving core (`Worker` sessions on a
+  hand-rolled fiber `Scheduler`, one worker Ractor per core in
+  production), the IMAP session (`ImapServer`), MIME parsing, and stores
+  (`Store::Memory` reference implementation, `Store::Http` production
+  client, `Store::Contracts` executable contract suite).
 - `lib/mail_on_rails/imap/daemon.rb` - env-driven runtime; also embeddable
   in a host process (e.g. inside Puma in development, passing your own
   store and logger).
@@ -47,6 +75,8 @@ arbitrary binary survives JSON.
 | `MAIL_ON_RAILS_TLS_CERT` / `_TLS_KEY` | - | PEM paths (else self-signed under `MAIL_ON_RAILS_TLS_DIR`, default `storage/tls`) |
 | `MAIL_ON_RAILS_IMAP_MAX_CONN` | `100` | Connection cap |
 | `MAIL_ON_RAILS_IMAP_MAX_LINE` | `65536` | Command-line length cap |
+| `MAIL_ON_RAILS_IMAP_WORKERS` | CPU cores | Session worker count |
+| `MAIL_ON_RAILS_IMAP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
 
 ## Test / run
 
