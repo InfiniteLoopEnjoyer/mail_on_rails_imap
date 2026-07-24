@@ -18,4 +18,11 @@ Gem::Specification.new do |spec|
 
   spec.files = Dir["lib/**/*.rb"] + %w[LICENSE README.md]
   spec.require_paths = [ "lib" ]
+
+  # logger stopped being a default gem in Ruby 4.0, so `require "logger"`
+  # (daemon.rb, store/http.rb) raises LoadError under bundler unless it is
+  # declared. In the Rails app the dependency comes in through Rails; the
+  # standalone container has nothing else pulling it, so bin/server used to
+  # crash-loop on boot.
+  spec.add_dependency "logger"
 end

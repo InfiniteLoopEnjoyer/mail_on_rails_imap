@@ -2,6 +2,7 @@ PATH
   remote: .
   specs:
     mail_on_rails_imap (0.1.0)
+      logger
 
 GEM
   remote: https://rubygems.org/
