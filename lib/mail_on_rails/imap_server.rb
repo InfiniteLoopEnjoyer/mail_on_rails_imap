@@ -22,7 +22,7 @@ module MailOnRails
   # encrypted (LOGINDISABLED advertised in the clear).
   class ImapServer < Imap::Server
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ID"
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN ID"
     FLAGS = "\\Answered \\Flagged \\Deleted \\Seen \\Draft"
     MAX_LITERAL_BYTES = 30 * 1024 * 1024
     # How often an idling session re-checks the store for changes. The
@@ -786,7 +786,6 @@ module MailOnRails
 
       # -- SEARCH ----------------------------------------------------------------
 
-      RAW_SEARCH_KEYS = %w[HEADER FROM TO CC BCC SUBJECT TEXT BODY SENTBEFORE SENTON SENTSINCE].freeze
       # Matching is byte-oriented, so only ASCII-clean charsets are honest
       # to accept (RFC 3501 requires US-ASCII and UTF-8 support).
       SEARCH_CHARSETS = %w[US-ASCII UTF-8].freeze
@@ -794,8 +793,19 @@ module MailOnRails
       # Raised for malformed search criteria; the message becomes the BAD text.
       class SearchSyntaxError < StandardError; end
 
+      # A compiled search key: raw marks keys that need message bytes
+      # (header/body content), so SEARCH can filter on metadata first and
+      # fetch raw bytes only for the messages that survive.
+      SearchKey = Struct.new(:raw, :fn) do
+        def call(seq, msg) = fn.call(seq, msg)
+        def raw? = raw
+      end
+
+      ESEARCH_OPTIONS = %w[MIN MAX COUNT ALL].freeze
+
       def search(tag, args, uid_mode)
         criteria = args.dup
+        return_opts = parse_search_return(criteria)
         if criteria.first.is_a?(String) && criteria.first.casecmp?("CHARSET")
           charset = criteria.shift(2)[1].to_s
           unless SEARCH_CHARSETS.any? { |c| charset.casecmp?(c) }
@@ -803,22 +813,78 @@ module MailOnRails
           end
         end
 
-        need_raw = criteria.any? { |t| t.is_a?(String) && RAW_SEARCH_KEYS.include?(t.upcase) }
-
         matchers = []
         matchers << parse_search_key(criteria, uid_mode) until criteria.empty?
         matchers.compact!
+        meta_keys, raw_keys = matchers.partition { |k| !k.raw? }
 
+        # Two-phase evaluation: metadata keys (flags, dates, sizes, sets)
+        # run against the cheap metadata fetch; message bytes are pulled
+        # only for the survivors that content keys still need to inspect.
         all = @uids.each_with_index.map { |uid, idx| [ idx + 1, uid ] }
-        messages = fetch_messages(@uids, need_raw)
+        messages = fetch_messages(@uids, false)
         hits = all.select do |seq, uid|
           msg = messages[uid]
-          msg && matchers.all? { |k| k.call(seq, msg) }
+          msg && meta_keys.all? { |k| k.call(seq, msg) }
         end
-        untagged "SEARCH #{hits.map { |seq, uid| uid_mode ? uid : seq }.join(" ")}".rstrip
+        if raw_keys.any? && hits.any?
+          raw_messages = fetch_messages(hits.map(&:last), true)
+          hits = hits.select do |seq, uid|
+            msg = raw_messages[uid]
+            msg && raw_keys.all? { |k| k.call(seq, msg) }
+          end
+        end
+        ids = hits.map { |seq, uid| uid_mode ? uid : seq }
+        if return_opts
+          untagged esearch_response(tag, ids, return_opts, uid_mode)
+        else
+          untagged "SEARCH #{ids.join(" ")}".rstrip
+        end
         tagged tag, "OK SEARCH completed"
       rescue SearchSyntaxError => e
         tagged tag, "BAD #{e.message}"
+      end
+
+      # RFC 4731 "SEARCH RETURN (...)"; nil when absent (classic SEARCH).
+      def parse_search_return(criteria)
+        return nil unless criteria.first.is_a?(String) && criteria.first.casecmp?("RETURN")
+
+        criteria.shift
+        raise SearchSyntaxError, "SEARCH RETURN expects an option list" unless criteria.first == :lparen
+
+        criteria.shift
+        opts = []
+        until criteria.first == :rparen
+          raise SearchSyntaxError, "SEARCH RETURN expects an option list" if criteria.empty?
+
+          opts << criteria.shift.to_s.upcase
+        end
+        criteria.shift
+        unknown = opts - ESEARCH_OPTIONS
+        raise SearchSyntaxError, "Unsupported SEARCH RETURN option #{unknown.first}" if unknown.any?
+
+        opts.empty? ? %w[ALL] : opts
+      end
+
+      # RFC 4731: MIN/MAX/ALL are omitted when nothing matched; COUNT is
+      # always present when requested. The TAG correlator is mandatory.
+      def esearch_response(tag, ids, opts, uid_mode)
+        parts = []
+        parts << "MIN #{ids.min}" if opts.include?("MIN") && ids.any?
+        parts << "MAX #{ids.max}" if opts.include?("MAX") && ids.any?
+        parts << "COUNT #{ids.size}" if opts.include?("COUNT")
+        parts << "ALL #{compress_set(ids)}" if opts.include?("ALL") && ids.any?
+        out = +%(ESEARCH (TAG "#{tag}"))
+        out << " UID" if uid_mode
+        out << " " << parts.join(" ") if parts.any?
+        out
+      end
+
+      # Collapses sorted ids into RFC sequence-set form: [1,2,3,5] -> "1:3,5".
+      def compress_set(ids)
+        ids.sort.slice_when { |a, b| b != a + 1 }
+           .map { |run| run.size == 1 ? run.first.to_s : "#{run.first}:#{run.last}" }
+           .join(",")
       end
 
       def parse_search_key(toks, uid_mode)
@@ -830,12 +896,12 @@ module MailOnRails
           keys << parse_search_key(toks, uid_mode) until toks.empty? || toks.first == :rparen
           toks.shift
           keys.compact!
-          return ->(seq, msg) { keys.all? { |k| k.call(seq, msg) } }
+          return SearchKey.new(keys.any?(&:raw?), ->(seq, msg) { keys.all? { |k| k.call(seq, msg) } })
         end
         return nil unless tok.is_a?(String)
 
         case tok.upcase
-        when "ALL" then ->(_seq, _msg) { true }
+        when "ALL" then meta_key { |_seq, _msg| true }
         when "ANSWERED"   then flag_key("\\Answered")
         when "DELETED"    then flag_key("\\Deleted")
         when "DRAFT"      then flag_key("\\Draft")
@@ -846,8 +912,8 @@ module MailOnRails
         when "UNDRAFT"    then negate(flag_key("\\Draft"))
         when "UNFLAGGED"  then negate(flag_key("\\Flagged"))
         when "UNSEEN"     then negate(flag_key("\\Seen"))
-        when "RECENT", "NEW" then ->(_seq, _msg) { false }
-        when "OLD" then ->(_seq, _msg) { true }
+        when "RECENT", "NEW" then meta_key { |_seq, _msg| false }
+        when "OLD" then meta_key { |_seq, _msg| true }
         when "KEYWORD" then flag_key(toks.shift.to_s)
         when "UNKEYWORD" then negate(flag_key(toks.shift.to_s))
         when "NOT"
@@ -860,12 +926,12 @@ module MailOnRails
           b = parse_search_key(toks, uid_mode)
           raise SearchSyntaxError, "OR expects two search keys" if a.nil? || b.nil?
 
-          ->(seq, msg) { a.call(seq, msg) || b.call(seq, msg) }
+          SearchKey.new(a.raw? || b.raw?, ->(seq, msg) { a.call(seq, msg) || b.call(seq, msg) })
         when "UID"
           uids = resolve_set(toks.shift.to_s, true).map(&:last)
-          ->(_seq, msg) { uids.include?(msg[:uid]) }
-        when "LARGER"  then min = toks.shift.to_i; ->(_seq, msg) { msg[:size] > min }
-        when "SMALLER" then max = toks.shift.to_i; ->(_seq, msg) { msg[:size] < max }
+          meta_key { |_seq, msg| uids.include?(msg[:uid]) }
+        when "LARGER"  then min = toks.shift.to_i; meta_key { |_seq, msg| msg[:size] > min }
+        when "SMALLER" then max = toks.shift.to_i; meta_key { |_seq, msg| msg[:size] < max }
         when "SINCE"  then date_key(toks.shift) { |msg_day, day| msg_day >= day }
         when "BEFORE" then date_key(toks.shift) { |msg_day, day| msg_day < day }
         when "ON"     then date_key(toks.shift) { |msg_day, day| msg_day == day }
@@ -881,31 +947,45 @@ module MailOnRails
         when "CC"      then header_key("cc", toks.shift.to_s)
         when "BCC"     then header_key("bcc", toks.shift.to_s)
         when "SUBJECT" then header_key("subject", toks.shift.to_s)
-        when "TEXT", "BODY"
+        when "TEXT"
           value = toks.shift.to_s.downcase
-          ->(_seq, msg) { msg[:raw].to_s.downcase.include?(value) }
+          raw_key { |_seq, msg| msg[:raw].to_s.downcase.include?(value) }
+        when "BODY"
+          # Unlike TEXT, BODY matches the body only, never the header.
+          value = toks.shift.to_s.downcase
+          raw_key { |_seq, msg| Mime.split_header(msg[:raw].to_s)[1].downcase.include?(value) }
+        when "OLDER"   then age_key(toks.shift) { |age, seconds| age >= seconds }
+        when "YOUNGER" then age_key(toks.shift) { |age, seconds| age <= seconds }
         when /\A[\d*][\d,:*]*\z/
           pairs = resolve_set(tok, false)
           seqs = pairs.map(&:first)
-          ->(seq, _msg) { seqs.include?(seq) }
+          meta_key { |seq, _msg| seqs.include?(seq) }
         else
           raise SearchSyntaxError, "Unknown search key #{tok.upcase}"
         end
       end
 
+      def meta_key(&fn)
+        SearchKey.new(false, fn)
+      end
+
+      def raw_key(&fn)
+        SearchKey.new(true, fn)
+      end
+
       def negate(key)
         return nil if key.nil?
 
-        ->(seq, msg) { !key.call(seq, msg) }
+        SearchKey.new(key.raw?, ->(seq, msg) { !key.call(seq, msg) })
       end
 
       def flag_key(flag)
-        ->(_seq, msg) { (@flags[msg[:uid]] || msg[:flags]).include?(flag) }
+        meta_key { |_seq, msg| (@flags[msg[:uid]] || msg[:flags]).include?(flag) }
       end
 
       def date_key(str, &compare)
         day = parse_search_date(str)
-        ->(_seq, msg) { compare.call(msg[:internal_date] / 86_400, day) }
+        meta_key { |_seq, msg| compare.call(msg[:internal_date] / 86_400, day) }
       end
 
       # SENTBEFORE/SENTON/SENTSINCE compare against the Date: header
@@ -913,7 +993,7 @@ module MailOnRails
       # header don't match.
       def sent_date_key(str, &compare)
         day = parse_search_date(str)
-        lambda do |_seq, msg|
+        raw_key do |_seq, msg|
           value = Mime.parse_headers(Mime.split_header(msg[:raw].to_s)[0])["date"]&.first
           sent_day = begin
             value && Time.parse(value).to_i / 86_400
@@ -930,10 +1010,21 @@ module MailOnRails
         raise SearchSyntaxError, "Invalid date #{str}"
       end
 
+      # RFC 5032 OLDER/YOUNGER: message age in seconds vs INTERNALDATE.
+      def age_key(str, &compare)
+        seconds = begin
+          Integer(str.to_s, 10)
+        rescue ArgumentError
+          raise SearchSyntaxError, "Invalid interval #{str}"
+        end
+        now = Time.now.to_i
+        meta_key { |_seq, msg| compare.call(now - msg[:internal_date], seconds) }
+      end
+
       def header_key(name, value)
         name = name.downcase
         value = value.downcase
-        lambda do |_seq, msg|
+        raw_key do |_seq, msg|
           headers = Mime.parse_headers(Mime.split_header(msg[:raw].to_s)[0])
           headers[name].to_a.any? { |v| v.downcase.include?(value) }
         end
@@ -969,6 +1060,9 @@ module MailOnRails
           code = result[:code] == :notfound ? "[TRYCREATE] " : ""
           tagged tag, "NO #{code}APPEND failed: #{result[:error]}"
         else
+          # An APPEND into the selected mailbox must surface as an
+          # untagged EXISTS (RFC 3501 §6.3.11) before the tagged OK.
+          resync if @selected && @selected[:name].casecmp?(name)
           tagged tag, "OK [APPENDUID #{result[:uid_validity]} #{result[:uid]}] APPEND completed"
         end
       end

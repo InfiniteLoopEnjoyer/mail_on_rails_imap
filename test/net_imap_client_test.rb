@@ -95,6 +95,13 @@ class NetImapClientTest < Minitest::Test
       assert_equal [ 1 ], imap.search([ "SUBJECT", "greetings" ])
       assert_equal [ 1 ], imap.search([ "SENTON", Date.new(2025, 7, 15) ])
       assert_equal [], imap.search([ "SENTON", Date.new(2024, 1, 1) ])
+
+      esearch = imap.search([ "ALL" ], return: %w[MIN MAX COUNT ALL])
+      assert_kind_of Net::IMAP::ESearchResult, esearch
+      assert_equal 1, esearch.min
+      assert_equal 1, esearch.max
+      assert_equal 1, esearch.count
+      assert_equal [ 1 ], esearch.to_a
     end
   end
 

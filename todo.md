@@ -45,13 +45,30 @@ Rule: every item lands with tests.
 
 ## Tier 2 — later
 
-- [ ] CONDSTORE/QRESYNC (needs modseq column in Rails store) — only after IDLE
-- [ ] ESEARCH `RETURN (MIN MAX COUNT ALL)` — must include `(TAG "...")` correlator
-- [ ] AUTH=SCRAM-SHA-256
-- [ ] SEARCH quality: differentiate `TEXT` vs `BODY` (BODY excludes headers);
-      push flag/date/size keys down into SQL via a store `search` op
-- [ ] Keyword flags end-to-end tests (advertised `PERMANENTFLAGS \*` — verify persistence)
-- [ ] OLDER/YOUNGER (RFC 5032)
+- [x] ESEARCH `RETURN (MIN MAX COUNT ALL)` with `(TAG "...")` correlator,
+      `RETURN ()` = ALL, MIN/MAX/ALL omitted on empty results — DONE 2026-07-27,
+      advertised, verified through net-imap's ESearchResult
+- [x] `TEXT` vs `BODY` differentiated (BODY excludes headers) — DONE 2026-07-27
+- [x] OLDER/YOUNGER (RFC 5032) — DONE 2026-07-27, `WITHIN` advertised
+- [x] Keyword flags end-to-end tests (STORE/FETCH/SEARCH KEYWORD round trip)
+- [x] Bonus fix found by testing: APPEND into the selected mailbox now
+      announces untagged EXISTS before the tagged OK (RFC 3501 §6.3.11)
+- [ ] CONDSTORE/QRESYNC — needs a modseq column in the Rails store, modseq
+      bump on every flag write/append/expunge, HIGHESTMODSEQ in SELECT/STATUS,
+      FETCH CHANGEDSINCE / STORE UNCHANGEDSINCE / SEARCH MODSEQ, VANISHED.
+      Largest remaining item; touches all four store layers + a migration.
+- [ ] AUTH=SCRAM-SHA-256 — server needs per-account salt/iterations/
+      StoredKey/ServerKey, derived at password-set time in the Rails app
+      (bcrypt hash alone can't do SCRAM). New store op to fetch SCRAM creds.
+- [x] SEARCH raw-fetch elimination — two-phase evaluation (2026-07-27):
+      keys are compiled as SearchKey(raw?, fn); metadata keys (flags, dates,
+      sizes, sets, OLDER/YOUNGER) filter first against a metadata-only fetch,
+      then message bytes are pulled ONLY for survivors that content keys
+      (HEADER/FROM/SUBJECT/TEXT/BODY/SENT*) still need. A flags-only search
+      never touches raw bytes at all.
+- [ ] (optional, later) true SQL pushdown — a store `search` op could also
+      skip the metadata fetch, but with two-phase evaluation the remaining
+      win is small; revisit only if metadata volume becomes a problem
 
 ## Testing strategy
 
@@ -63,9 +80,9 @@ Rule: every item lands with tests.
       SEARCH keys (BADCHARSET, unknown key, SENT* vs Date header), UTF-7
       round trips, IDLE, MOVE/UNSELECT/DELETE/RENAME, ID, capability string,
       ENVELOPE/BODYSTRUCTURE shape (test/mime_format_test.rb)
-- [ ] Still uncovered: multi-literal commands, sequence-set edge cases
-      (reversed ranges, `*` in empty mailbox), APPEND with flags+date parsing
-      edge cases, keyword-flag persistence
+- [x] Multi-literal commands (LOGIN with two sync literals), APPEND with
+      flags + INTERNALDATE, `*`/`1:*` sets against an empty mailbox,
+      keyword-flag persistence — covered 2026-07-27
 
 ## Anti-patterns seen in RIMS — do NOT copy
 

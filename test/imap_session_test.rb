@@ -323,11 +323,137 @@ class ImapSessionTest < Minitest::Test
   def test_capabilities_advertise_new_extensions
     with_session do |client|
       greeting = client.gets("\r\n")
-      %w[IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN UIDPLUS LITERAL\+ SASL-IR].each do |cap|
+      %w[IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN UIDPLUS LITERAL\+ SASL-IR].each do |cap|
         assert_match(/#{cap}/, greeting)
       end
       command(client, "g1", "LOGOUT")
     end
+  end
+
+  def test_esearch_return_options
+    @store.append(@account_id, "INBOX", RAW, [], nil) # uid 2
+    @store.append(@account_id, "INBOX", RAW, [], nil) # uid 3
+    with_session do |client|
+      login_and_select(client)
+
+      count = command(client, "e1", "SEARCH RETURN (COUNT) ALL")
+      assert_match(/\A\* ESEARCH \(TAG "e1"\) COUNT 3\r\ne1 OK/, count)
+
+      full = command(client, "e2", "UID SEARCH RETURN (MIN MAX ALL) 2:3")
+      assert_match(/\A\* ESEARCH \(TAG "e2"\) UID MIN 2 MAX 3 ALL 2:3\r\ne2 OK/, full)
+
+      # RETURN () means ALL (RFC 4731); no matches omits MIN/MAX/ALL.
+      empty_opts = command(client, "e3", "SEARCH RETURN () ALL")
+      assert_match(/\A\* ESEARCH \(TAG "e3"\) ALL 1:3\r\ne3 OK/, empty_opts)
+      none = command(client, "e4", "SEARCH RETURN (MIN COUNT) SUBJECT nosuch")
+      assert_match(/\A\* ESEARCH \(TAG "e4"\) COUNT 0\r\ne4 OK/, none)
+
+      assert_match(/\Ae5 BAD/, command(client, "e5", "SEARCH RETURN (BOGUS) ALL"))
+      command(client, "e6", "LOGOUT")
+    end
+  end
+
+  def test_older_and_younger_match_message_age
+    old_epoch = Time.now.to_i - 7200
+    @store.append(@account_id, "INBOX", RAW, [], old_epoch) # uid 2, two hours old
+    with_session do |client|
+      login_and_select(client)
+      assert_match(/\A\* SEARCH 2\r\n/, command(client, "w1", "SEARCH OLDER 3600"))
+      assert_match(/\A\* SEARCH 1\r\n/, command(client, "w2", "SEARCH YOUNGER 3600"))
+      assert_match(/\Aw3 BAD/, command(client, "w3", "SEARCH OLDER soon"))
+      command(client, "w4", "LOGOUT")
+    end
+  end
+
+  def test_body_searches_exclude_headers_unlike_text
+    with_session do |client|
+      login_and_select(client)
+      # "hi" appears only in the Subject header; "line" only in the body.
+      assert_match(/\A\* SEARCH 1\r\n/, command(client, "b1", "SEARCH TEXT hi"))
+      assert_match(/\A\* SEARCH\r\n/, command(client, "b2", "SEARCH BODY hi"))
+      assert_match(/\A\* SEARCH 1\r\n/, command(client, "b3", "SEARCH BODY line"))
+      command(client, "b4", "LOGOUT")
+    end
+  end
+
+  def test_keyword_flags_persist_and_search
+    with_session do |client|
+      login_and_select(client)
+      store = command(client, "k1", "STORE 1 +FLAGS ($Forwarded)")
+      assert_match(/\$Forwarded/, store)
+      assert_match(/\$Forwarded/, command(client, "k2", "FETCH 1 (FLAGS)"))
+      assert_match(/\A\* SEARCH 1\r\n/, command(client, "k3", "SEARCH KEYWORD $Forwarded"))
+      assert_match(/\A\* SEARCH\r\n/, command(client, "k4", "SEARCH UNKEYWORD $Forwarded"))
+      command(client, "k5", "LOGOUT")
+    end
+  end
+
+  def test_multi_literal_login_round_trip
+    with_session do |client|
+      client.gets("\r\n")
+      client.write("a1 LOGIN {#{EMAIL.bytesize}}\r\n")
+      assert_equal "+ OK\r\n", client.gets("\r\n")
+      client.write("#{EMAIL} {#{PASSWORD.bytesize}}\r\n")
+      assert_equal "+ OK\r\n", client.gets("\r\n")
+      client.write("#{PASSWORD}\r\n")
+      assert_match(/\Aa1 OK/, read_until_tagged(client, "a1"))
+      command(client, "a2", "LOGOUT")
+    end
+  end
+
+  def test_append_with_flags_and_internaldate
+    with_session do |client|
+      login_and_select(client)
+      client.write(%(p1 APPEND INBOX (\\Flagged) "15-Jul-2025 10:00:00 +0000" {#{RAW.bytesize}+}\r\n#{RAW}\r\n))
+      append = read_until_tagged(client, "p1")
+      assert_match(/\A\* 2 EXISTS\r\n/, append, "APPEND into the selected mailbox must announce EXISTS")
+      assert_match(/^p1 OK \[APPENDUID \d+ 2\]/, append)
+
+      fetch = command(client, "p2", "UID FETCH 2 (FLAGS INTERNALDATE)")
+      assert_match(/\\Flagged/, fetch)
+      assert_match(/INTERNALDATE "15-Jul-2025/, fetch)
+      command(client, "p3", "LOGOUT")
+    end
+  end
+
+  def test_empty_mailbox_star_sets_and_search_are_harmless
+    with_session do |client|
+      client.gets("\r\n")
+      command(client, "s1", "LOGIN #{EMAIL} #{PASSWORD}")
+      command(client, "s2", "SELECT Drafts")
+      assert_match(/\As3 OK/, command(client, "s3", "FETCH 1:* (UID)"))
+      assert_match(/\A\* SEARCH\r\ns4 OK/, command(client, "s4", "SEARCH ALL"))
+      assert_match(/\As5 OK/, command(client, "s5", "UID FETCH 1:* (FLAGS)"))
+      command(client, "s6", "LOGOUT")
+    end
+  end
+
+  # Records every fetch so tests can assert when raw bytes were pulled.
+  class SpyStore < MailOnRails::Imap::Store::Memory
+    def fetches = @fetches ||= []
+
+    def fetch(mailbox_id, uids, with_raw)
+      fetches << [ uids.dup.sort, with_raw ]
+      super
+    end
+  end
+
+  def test_search_fetches_raw_bytes_only_for_metadata_survivors
+    spy = SpyStore.new
+    @store = spy
+    @account_id = spy.add_account(email: EMAIL, password: PASSWORD)
+    spy.append(@account_id, "INBOX", RAW, [ "\\Deleted" ], nil) # uid 1
+    spy.append(@account_id, "INBOX", RAW, [], nil)              # uid 2
+
+    with_session do |client|
+      login_and_select(client)
+      assert_match(/\A\* SEARCH 1\r\n/, command(client, "q1", "SEARCH DELETED SUBJECT hi"))
+      command(client, "q2", "LOGOUT")
+    end
+
+    assert_includes spy.fetches, [ [ 1, 2 ], false ], "metadata pass should cover the whole mailbox"
+    assert_equal [ [ [ 1 ], true ] ], spy.fetches.select { |_uids, raw| raw },
+                 "raw bytes should be fetched only for the \\Deleted survivor"
   end
 
   def test_append_and_expunge_round_trip
