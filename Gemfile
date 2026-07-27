@@ -6,6 +6,10 @@ gemspec
 group :development do
   gem "minitest"
 
+  # Tests only: the strict reference IMAP client (integration tests drive
+  # the server with it) and the oracle for the UTF-7 codec tests.
+  gem "net-imap", require: false
+
   # Deploy this daemon as a Docker container (config/deploy.yml). Kamal
   # brings dotenv, which the deploy config uses to load .env for secrets.
   gem "kamal", require: false

@@ -69,6 +69,38 @@ module MailOnRails
           end
         end
 
+        def delete_mailbox(account_id, name)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            mailbox = find_mailbox(account, name)
+            return { error: "no such mailbox", code: :notfound } unless mailbox
+
+            account[:mailboxes].delete(mailbox[:name])
+            {}
+          end
+        end
+
+        # Renames the mailbox and everything under it in the "/" hierarchy.
+        def rename_mailbox(account_id, from, to)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            mailbox = find_mailbox(account, from)
+            return { error: "no such mailbox", code: :notfound } unless mailbox
+            return { error: "mailbox exists", code: :exists } if find_mailbox(account, to)
+
+            from_name = mailbox[:name]
+            prefix = "#{from_name}/"
+            account[:mailboxes].keys
+                   .select { |n| n == from_name || n.start_with?(prefix) }
+                   .each do |old_name|
+              moved = account[:mailboxes].delete(old_name)
+              moved[:name] = to + old_name[from_name.length..]
+              account[:mailboxes][moved[:name]] = moved
+            end
+            {}
+          end
+        end
+
         def select_mailbox(account_id, name)
           @lock.synchronize do
             account = @accounts.fetch(account_id) { return internal_error("unknown account") }
@@ -130,12 +162,16 @@ module MailOnRails
           end
         end
 
-        def expunge(mailbox_id)
+        # uids: nil removes every \Deleted message; a list restricts removal
+        # to \Deleted messages with those UIDs (UID EXPUNGE).
+        def expunge(mailbox_id, uids = nil)
           @lock.synchronize do
             mailbox = mailbox_by_id(mailbox_id)
             return { uids: [] } unless mailbox
 
-            doomed, kept = mailbox[:messages].partition { |m| m[:flags].include?("\\Deleted") }
+            doomed, kept = mailbox[:messages].partition do |m|
+              m[:flags].include?("\\Deleted") && (uids.nil? || uids.include?(m[:uid]))
+            end
             mailbox[:messages] = kept
             { uids: doomed.map { |m| m[:uid] }.sort }
           end
@@ -169,6 +205,30 @@ module MailOnRails
               src_uids << m[:uid]
               dest_uids << copied[:uid]
             end
+            { uid_validity: dest[:uid_validity], src_uids: src_uids, dest_uids: dest_uids }
+          end
+        end
+
+        # Atomic copy+remove (RFC 6851 MOVE): the message never exists in
+        # both mailboxes from an observer's point of view.
+        def move(mailbox_id, uids, dest_name)
+          @lock.synchronize do
+            source = mailbox_by_id(mailbox_id)
+            return internal_error("unknown mailbox") unless source
+
+            account = @accounts.values.find { |a| a[:mailboxes].value?(source) }
+            dest = find_mailbox(account, dest_name)
+            return { error: "no such mailbox", code: :notfound } unless dest
+
+            src_uids = []
+            dest_uids = []
+            moved = sorted(source).select { |m| uids.include?(m[:uid]) }
+            moved.each do |m|
+              copied = deliver_raw(dest, m[:raw], flags: m[:flags].dup, internal_date: m[:internal_date])
+              src_uids << m[:uid]
+              dest_uids << copied[:uid]
+            end
+            source[:messages] = source[:messages].reject { |m| src_uids.include?(m[:uid]) }
             { uid_validity: dest[:uid_validity], src_uids: src_uids, dest_uids: dest_uids }
           end
         end

@@ -4,22 +4,32 @@ require "strscan"
 require "time"
 require "mail_on_rails/imap/server"
 require "mail_on_rails/imap/session_helpers"
+require "mail_on_rails/imap/utf7"
+require "mail_on_rails/imap/version"
 require_relative "mime"
 
 module MailOnRails
   # IMAP4rev1 server (RFC 3501 subset), run on a thread by Imap::Daemon -
   # standalone in this repo's container via bin/server, or embedded in a
-  # host process in development. Covers what real clients - iOS Mail in particular - need to read a
-  # mailbox: LOGIN, LIST/LSUB, SELECT/EXAMINE, STATUS, (UID) FETCH with
-  # section fetches, (UID) STORE, (UID) SEARCH, (UID) COPY, APPEND,
-  # EXPUNGE, CLOSE, NOOP. Listens on a plaintext+STARTTLS port and an
+  # host process in development. Covers what real clients - iOS Mail in
+  # particular - need: LOGIN/AUTHENTICATE, LIST/LSUB (with SPECIAL-USE and
+  # CHILDREN attributes), SELECT/EXAMINE, STATUS, (UID) FETCH with section
+  # fetches, (UID) STORE, (UID) SEARCH, (UID) COPY, (UID) MOVE, APPEND,
+  # (UID) EXPUNGE, CLOSE, UNSELECT, NOOP, IDLE, CREATE/DELETE/RENAME,
+  # NAMESPACE, ID; mailbox names use modified UTF-7 on the wire (Imap::Utf7).
+  # Listens on a plaintext+STARTTLS port and an
   # implicit-TLS port; credentials are refused until the channel is
   # encrypted (LOGINDISABLED advertised in the clear).
   class ImapServer < Imap::Server
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ ID"
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ID"
     FLAGS = "\\Answered \\Flagged \\Deleted \\Seen \\Draft"
     MAX_LITERAL_BYTES = 30 * 1024 * 1024
+    # How often an idling session re-checks the store for changes. The
+    # store is the source of truth and other writers (delivery through the
+    # Rails app, other sessions, possibly other daemon processes) don't
+    # share this process, so polling it is the only complete update source.
+    IDLE_POLL_SECONDS = Integer(ENV.fetch("MAIL_ON_RAILS_IMAP_IDLE_POLL", 30))
     # Cap on a single (non-literal) command line, so a client can't exhaust
     # memory by sending endless bytes with no CRLF. Bulk data uses {n} IMAP
     # literals, which are bounded separately by MAX_LITERAL_BYTES.
@@ -104,7 +114,7 @@ module MailOnRails
       def capabilities
         caps = BASE_CAPABILITIES.dup
         if @tls
-          caps << " AUTH=PLAIN"
+          caps << " AUTH=PLAIN SASL-IR"
         else
           caps << " STARTTLS" if @tls_ctx
           caps << " LOGINDISABLED"
@@ -160,9 +170,7 @@ module MailOnRails
         while (m = parts.last.match(/\{(\d+)(\+)?\}\r\n\z/))
           size = m[1].to_i
           if size > MAX_LITERAL_BYTES
-            tag = parts.first.split(" ", 2).first
-            tagged tag, "NO literal too large"
-            return read_command
+            return refuse_literal(parts.first, size, non_sync: !m[2].nil?)
           end
           @socket.write("+ OK\r\n") unless m[2] # synchronizing literal
           data = read_exact(size)
@@ -188,6 +196,40 @@ module MailOnRails
         data
       end
 
+      # Refuses an over-size literal without desyncing the stream. For a
+      # synchronizing literal the continuation is simply withheld - the
+      # client never sends the octets. For LITERAL+ the client sends them
+      # regardless, so they (and any further non-sync literals in the same
+      # command) must be drained and discarded before the next command.
+      def refuse_literal(first_line, size, non_sync:)
+        tag = first_line.split(" ", 2).first
+        while non_sync
+          return nil unless discard_exact(size)
+
+          line = read_line
+          return nil unless line
+
+          m = line.match(/\{(\d+)(\+)?\}\r\n\z/)
+          break unless m
+
+          size = m[1].to_i
+          non_sync = !m[2].nil?
+        end
+        tagged tag, "NO literal too large"
+        read_command
+      end
+
+      def discard_exact(size)
+        remaining = size
+        while remaining.positive?
+          chunk = @socket.read([ remaining, 65_536 ].min)
+          return false unless chunk
+
+          remaining -= chunk.bytesize
+        end
+        true
+      end
+
       def untagged(text)
         @socket.write("* #{text}\r\n")
       end
@@ -211,6 +253,10 @@ module MailOnRails
         end
 
         dispatch(tag, name.upcase, tokens, uid_mode)
+      rescue IOError, SystemCallError, IO::TimeoutError, OpenSSL::SSL::SSLError
+        # Transport failures (including the over-length-line abort) are
+        # session-fatal; only command-level errors get a BAD.
+        raise
       rescue StandardError => e
         @store.log(:error, "IMAP command error: #{e.class}: #{e.message} #{e.backtrace&.first}")
         tagged tag || "*", "BAD Internal error"
@@ -221,7 +267,7 @@ module MailOnRails
         when "CAPABILITY"   then capability(tag)
         when "NOOP", "CHECK" then resync; tagged tag, "OK #{name} completed"
         when "LOGOUT"       then untagged "BYE mail_on_rails signing off"; tagged tag, "OK LOGOUT completed"; @logout = true
-        when "ID"           then untagged "ID NIL"; tagged tag, "OK ID completed"
+        when "ID"           then id(tag)
         when "LOGIN"        then login(tag, args)
         when "AUTHENTICATE" then authenticate(tag, args)
         when "STARTTLS"     then starttls(tag)
@@ -230,18 +276,21 @@ module MailOnRails
         when "LSUB"         then require_auth(tag) { list(tag, args, verb: "LSUB") }
         when "SUBSCRIBE", "UNSUBSCRIBE" then require_auth(tag) { tagged tag, "OK #{name} completed" }
         when "CREATE"       then require_auth(tag) { create(tag, args) }
-        when "DELETE", "RENAME" then require_auth(tag) { tagged tag, "NO #{name} not supported" }
+        when "DELETE"       then require_auth(tag) { delete(tag, args) }
+        when "RENAME"       then require_auth(tag) { rename(tag, args) }
         when "STATUS"       then require_auth(tag) { status(tag, args) }
         when "SELECT"       then require_auth(tag) { select(tag, args, read_only: false) }
         when "EXAMINE"      then require_auth(tag) { select(tag, args, read_only: true) }
         when "APPEND"       then require_auth(tag) { append(tag, args) }
         when "CLOSE"        then require_selected(tag) { close(tag) }
-        when "EXPUNGE"      then require_selected(tag) { expunge(tag) }
+        when "UNSELECT"     then require_selected(tag) { unselect(tag) }
+        when "EXPUNGE"      then require_selected(tag) { expunge(tag, uid_mode ? args : nil) }
         when "FETCH"        then require_selected(tag) { fetch(tag, args, uid_mode) }
         when "STORE"        then require_selected(tag) { store(tag, args, uid_mode) }
         when "COPY"         then require_selected(tag) { copy(tag, args, uid_mode) }
+        when "MOVE"         then require_selected(tag) { move(tag, args, uid_mode) }
         when "SEARCH"       then require_selected(tag) { search(tag, args, uid_mode) }
-        when "IDLE"         then tagged tag, "NO IDLE not supported"
+        when "IDLE"         then require_auth(tag) { idle(tag) }
         else tagged tag, "BAD Unknown command #{name}"
         end
       end
@@ -300,7 +349,10 @@ module MailOnRails
 
         unless initial
           @socket.write("+ \r\n")
-          initial = @socket.gets("\r\n").to_s.chomp
+          line = read_line
+          return unless line
+
+          initial = line.chomp("\r\n")
           return tagged(tag, "BAD Authentication cancelled") if initial == "*"
         end
         _authzid, user, pass = decode_sasl_plain(initial)
@@ -330,10 +382,21 @@ module MailOnRails
         end
       end
 
+      def id(tag)
+        untagged %(ID ("name" "mail_on_rails" "version" "#{Imap::VERSION}"))
+        tagged tag, "OK ID completed"
+      end
+
       def namespace(tag)
         untagged %(NAMESPACE (("" "/")) NIL NIL)
         tagged tag, "OK NAMESPACE completed"
       end
+
+      # RFC 6154 well-known mailboxes, advertised via SPECIAL-USE
+      # attributes so clients auto-map their folders.
+      SPECIAL_USE = {
+        "Sent" => "\\Sent", "Drafts" => "\\Drafts", "Trash" => "\\Trash", "Junk" => "\\Junk"
+      }.freeze
 
       def list(tag, args, verb:)
         ref, pattern = args
@@ -342,13 +405,21 @@ module MailOnRails
         if pattern.empty?
           untagged %(#{verb} (\\Noselect) "/" "")
         else
-          regex = wildcard_regex(ref.to_s + pattern)
+          regex = wildcard_regex(Imap::Utf7.decode(ref.to_s + pattern))
           names = mailbox_names
           names.each do |name|
-            untagged %(#{verb} (\\HasNoChildren) "/" #{Mime.quote(name)}) if name.match?(regex)
+            next unless name.match?(regex)
+
+            untagged %(#{verb} (#{list_attributes(name, names)}) "/" #{Mime.quote(Imap::Utf7.encode(name))})
           end
         end
         tagged tag, "OK #{verb} completed"
+      end
+
+      def list_attributes(name, names)
+        attrs = [ names.any? { |n| n.start_with?("#{name}/") } ? "\\HasChildren" : "\\HasNoChildren" ]
+        attrs << SPECIAL_USE[name] if SPECIAL_USE.key?(name)
+        attrs.join(" ")
       end
 
       def mailbox_names
@@ -369,7 +440,7 @@ module MailOnRails
       end
 
       def create(tag, args)
-        name = args.first.to_s
+        name = Imap::Utf7.decode(args.first.to_s)
         return tagged(tag, "BAD CREATE expects a mailbox name") if name.empty?
 
         result = @store.create_mailbox(@account_id, name)
@@ -380,8 +451,41 @@ module MailOnRails
         end
       end
 
+      def delete(tag, args)
+        name = Imap::Utf7.decode(args.first.to_s)
+        return tagged(tag, "BAD DELETE expects a mailbox name") if name.empty?
+        return tagged(tag, "NO Cannot delete INBOX") if name.casecmp?("INBOX")
+
+        result = @store.delete_mailbox(@account_id, name)
+        if result[:error]
+          tagged tag, "NO DELETE failed: #{result[:error]}"
+        else
+          tagged tag, "OK DELETE completed"
+        end
+      end
+
+      def rename(tag, args)
+        from, to = args.first(2).map { |a| Imap::Utf7.decode(a.to_s) }
+        return tagged(tag, "BAD RENAME expects two mailbox names") if from.empty? || to.to_s.empty?
+        # RFC 3501's special INBOX-rename semantics (move contents, keep
+        # INBOX) are not implemented; refusing is safer than surprising.
+        return tagged(tag, "NO Cannot rename INBOX") if from.casecmp?("INBOX")
+
+        result = @store.rename_mailbox(@account_id, from, to)
+        if result[:error]
+          tagged tag, "NO RENAME failed: #{result[:error]}"
+        else
+          # The selected mailbox keeps its id across a rename; only the
+          # name (used by resync) needs updating.
+          if @selected && (@selected[:name] == from || @selected[:name].start_with?("#{from}/"))
+            @selected[:name] = to + @selected[:name][from.length..]
+          end
+          tagged tag, "OK RENAME completed"
+        end
+      end
+
       def status(tag, args)
-        name = args.shift.to_s
+        name = Imap::Utf7.decode(args.shift.to_s)
         items = args.select { |a| a.is_a?(String) }.map(&:upcase)
         result = @store.status(@account_id, name)
         return tagged(tag, "NO STATUS failed: no such mailbox") if result[:error]
@@ -395,12 +499,12 @@ module MailOnRails
         }
         items = values.keys if items.empty?
         pairs = items.filter_map { |i| "#{i} #{values[i]}" if values.key?(i) }
-        untagged "STATUS #{Mime.quote(name)} (#{pairs.join(" ")})"
+        untagged "STATUS #{Mime.quote(Imap::Utf7.encode(name))} (#{pairs.join(" ")})"
         tagged tag, "OK STATUS completed"
       end
 
       def select(tag, args, read_only:)
-        name = args.first.to_s
+        name = Imap::Utf7.decode(args.first.to_s)
         result = @store.select_mailbox(@account_id, name)
         if result[:error]
           @selected = nil
@@ -432,10 +536,29 @@ module MailOnRails
         tagged tag, "OK CLOSE completed"
       end
 
-      def expunge(tag)
+      # RFC 3691: like CLOSE but without the implicit expunge.
+      def unselect(tag)
+        @selected = nil
+        @uids = []
+        @flags = {}
+        tagged tag, "OK UNSELECT completed"
+      end
+
+      # Plain EXPUNGE removes every \Deleted message; UID EXPUNGE (UIDPLUS,
+      # uid_args non-nil) removes only \Deleted messages within the given set.
+      def expunge(tag, uid_args = nil)
         return tagged(tag, "NO Mailbox is read-only") if @read_only
 
-        result = @store.expunge(@selected[:mailbox_id])
+        uids = nil
+        if uid_args
+          set = uid_args.first
+          return tagged(tag, "BAD UID EXPUNGE expects a sequence set") unless set.is_a?(String)
+
+          uids = resolve_set(set, true).map(&:last)
+          return tagged(tag, "OK EXPUNGE completed") if uids.empty?
+        end
+
+        result = @store.expunge(@selected[:mailbox_id], uids)
         removed = result[:uids] || []
         @uids.each_with_index.to_a.reverse_each do |uid, idx|
           next unless removed.include?(uid)
@@ -622,7 +745,7 @@ module MailOnRails
         wanted = resolve_set(set, uid_mode)
         return tagged(tag, "OK COPY completed (nothing to copy)") if wanted.empty?
 
-        result = @store.copy(@selected[:mailbox_id], wanted.map(&:last), dest)
+        result = @store.copy(@selected[:mailbox_id], wanted.map(&:last), Imap::Utf7.decode(dest))
         if result[:error]
           code = result[:code] == :notfound ? "[TRYCREATE] " : ""
           tagged tag, "NO #{code}COPY failed: #{result[:error]}"
@@ -632,30 +755,70 @@ module MailOnRails
         end
       end
 
+      # RFC 6851 MOVE: a single atomic store operation, so the message can
+      # never exist in both mailboxes (or neither) on a failure.
+      def move(tag, args, uid_mode)
+        set, dest = args
+        return tagged(tag, "BAD MOVE expects a sequence set and mailbox") unless set.is_a?(String) && dest.is_a?(String)
+        return tagged(tag, "NO Mailbox is read-only") if @read_only
+
+        wanted = resolve_set(set, uid_mode)
+        return tagged(tag, "OK MOVE completed (nothing to move)") if wanted.empty?
+
+        result = @store.move(@selected[:mailbox_id], wanted.map(&:last), Imap::Utf7.decode(dest))
+        if result[:error]
+          code = result[:code] == :notfound ? "[TRYCREATE] " : ""
+          return tagged(tag, "NO #{code}MOVE failed: #{result[:error]}")
+        end
+
+        # RFC 6851: COPYUID rides an untagged OK and precedes the EXPUNGEs.
+        untagged "OK [COPYUID #{result[:uid_validity]} #{result[:src_uids].join(",")} #{result[:dest_uids].join(",")}]"
+        moved = result[:src_uids]
+        @uids.each_with_index.to_a.reverse_each do |uid, idx|
+          next unless moved.include?(uid)
+
+          untagged "#{idx + 1} EXPUNGE"
+          @flags.delete(uid)
+        end
+        @uids -= moved
+        tagged tag, "OK MOVE completed"
+      end
+
       # -- SEARCH ----------------------------------------------------------------
 
       RAW_SEARCH_KEYS = %w[HEADER FROM TO CC BCC SUBJECT TEXT BODY SENTBEFORE SENTON SENTSINCE].freeze
+      # Matching is byte-oriented, so only ASCII-clean charsets are honest
+      # to accept (RFC 3501 requires US-ASCII and UTF-8 support).
+      SEARCH_CHARSETS = %w[US-ASCII UTF-8].freeze
+
+      # Raised for malformed search criteria; the message becomes the BAD text.
+      class SearchSyntaxError < StandardError; end
 
       def search(tag, args, uid_mode)
         criteria = args.dup
         if criteria.first.is_a?(String) && criteria.first.casecmp?("CHARSET")
-          criteria.shift(2)
+          charset = criteria.shift(2)[1].to_s
+          unless SEARCH_CHARSETS.any? { |c| charset.casecmp?(c) }
+            return tagged(tag, "NO [BADCHARSET (#{SEARCH_CHARSETS.join(" ")})] Charset not supported")
+          end
         end
 
         need_raw = criteria.any? { |t| t.is_a?(String) && RAW_SEARCH_KEYS.include?(t.upcase) }
-        all = @uids.each_with_index.map { |uid, idx| [ idx + 1, uid ] }
-        messages = fetch_messages(@uids, need_raw)
 
         matchers = []
         matchers << parse_search_key(criteria, uid_mode) until criteria.empty?
         matchers.compact!
 
+        all = @uids.each_with_index.map { |uid, idx| [ idx + 1, uid ] }
+        messages = fetch_messages(@uids, need_raw)
         hits = all.select do |seq, uid|
           msg = messages[uid]
           msg && matchers.all? { |k| k.call(seq, msg) }
         end
         untagged "SEARCH #{hits.map { |seq, uid| uid_mode ? uid : seq }.join(" ")}".rstrip
         tagged tag, "OK SEARCH completed"
+      rescue SearchSyntaxError => e
+        tagged tag, "BAD #{e.message}"
       end
 
       def parse_search_key(toks, uid_mode)
@@ -687,11 +850,17 @@ module MailOnRails
         when "OLD" then ->(_seq, _msg) { true }
         when "KEYWORD" then flag_key(toks.shift.to_s)
         when "UNKEYWORD" then negate(flag_key(toks.shift.to_s))
-        when "NOT" then negate(parse_search_key(toks, uid_mode))
+        when "NOT"
+          key = parse_search_key(toks, uid_mode)
+          raise SearchSyntaxError, "NOT expects a search key" if key.nil?
+
+          negate(key)
         when "OR"
           a = parse_search_key(toks, uid_mode)
           b = parse_search_key(toks, uid_mode)
-          ->(seq, msg) { (a.nil? || a.call(seq, msg)) || (b.nil? || b.call(seq, msg)) }
+          raise SearchSyntaxError, "OR expects two search keys" if a.nil? || b.nil?
+
+          ->(seq, msg) { a.call(seq, msg) || b.call(seq, msg) }
         when "UID"
           uids = resolve_set(toks.shift.to_s, true).map(&:last)
           ->(_seq, msg) { uids.include?(msg[:uid]) }
@@ -700,9 +869,9 @@ module MailOnRails
         when "SINCE"  then date_key(toks.shift) { |msg_day, day| msg_day >= day }
         when "BEFORE" then date_key(toks.shift) { |msg_day, day| msg_day < day }
         when "ON"     then date_key(toks.shift) { |msg_day, day| msg_day == day }
-        when "SENTSINCE"  then date_key(toks.shift) { |msg_day, day| msg_day >= day }
-        when "SENTBEFORE" then date_key(toks.shift) { |msg_day, day| msg_day < day }
-        when "SENTON"     then date_key(toks.shift) { |msg_day, day| msg_day == day }
+        when "SENTSINCE"  then sent_date_key(toks.shift) { |msg_day, day| msg_day >= day }
+        when "SENTBEFORE" then sent_date_key(toks.shift) { |msg_day, day| msg_day < day }
+        when "SENTON"     then sent_date_key(toks.shift) { |msg_day, day| msg_day == day }
         when "HEADER"
           name = toks.shift.to_s
           value = toks.shift.to_s
@@ -720,7 +889,7 @@ module MailOnRails
           seqs = pairs.map(&:first)
           ->(seq, _msg) { seqs.include?(seq) }
         else
-          ->(_seq, _msg) { true } # unknown key: don't filter
+          raise SearchSyntaxError, "Unknown search key #{tok.upcase}"
         end
       end
 
@@ -735,10 +904,30 @@ module MailOnRails
       end
 
       def date_key(str, &compare)
-        day = Time.strptime(str.to_s, "%d-%b-%Y").to_i / 86_400
+        day = parse_search_date(str)
         ->(_seq, msg) { compare.call(msg[:internal_date] / 86_400, day) }
+      end
+
+      # SENTBEFORE/SENTON/SENTSINCE compare against the Date: header
+      # (RFC 3501), not INTERNALDATE. Messages without a parseable Date
+      # header don't match.
+      def sent_date_key(str, &compare)
+        day = parse_search_date(str)
+        lambda do |_seq, msg|
+          value = Mime.parse_headers(Mime.split_header(msg[:raw].to_s)[0])["date"]&.first
+          sent_day = begin
+            value && Time.parse(value).to_i / 86_400
+          rescue ArgumentError
+            nil
+          end
+          !sent_day.nil? && compare.call(sent_day, day)
+        end
+      end
+
+      def parse_search_date(str)
+        Time.strptime(str.to_s, "%d-%b-%Y").to_i / 86_400
       rescue ArgumentError
-        ->(_seq, _msg) { true }
+        raise SearchSyntaxError, "Invalid date #{str}"
       end
 
       def header_key(name, value)
@@ -753,7 +942,7 @@ module MailOnRails
       # -- APPEND ----------------------------------------------------------------
 
       def append(tag, args)
-        name = args.shift.to_s
+        name = Imap::Utf7.decode(args.shift.to_s)
         message = args.pop
         return tagged(tag, "BAD APPEND expects a mailbox and message") if name.empty? || !message.is_a?(String)
 
@@ -784,16 +973,42 @@ module MailOnRails
         end
       end
 
-      # -- resync ------------------------------------------------------------------
+      # -- IDLE / resync -----------------------------------------------------------
 
-      # Refreshes the mailbox snapshot on NOOP/CHECK so clients learn about
-      # newly delivered or externally deleted messages.
+      # RFC 2177. The session blocks here pushing untagged updates (found
+      # by polling resync) until the client sends DONE.
+      def idle(tag)
+        @socket.write("+ idling\r\n")
+        loop do
+          if wait_readable(IDLE_POLL_SECONDS)
+            line = read_line
+            return unless line
+            return tagged(tag, "OK IDLE terminated") if line.chomp("\r\n").casecmp?("DONE")
+
+            return tagged(tag, "BAD Expected DONE")
+          end
+          resync
+        end
+      end
+
+      # True when input is waiting, false on timeout. TLS can hold
+      # decrypted bytes buffered past the raw fd, so check there first.
+      def wait_readable(seconds)
+        return true if @socket.respond_to?(:pending) && @socket.pending.positive?
+
+        !IO.select([ io_for(@socket) ], nil, nil, seconds).nil?
+      end
+
+      # Refreshes the mailbox snapshot (on NOOP/CHECK and from the IDLE
+      # loop) so clients learn about newly delivered or externally deleted
+      # messages and flag changes made by other sessions.
       def resync
         return unless @selected
 
         result = @store.select_mailbox(@account_id, @selected[:name])
         return if result[:error]
 
+        old_flags = @flags
         new_uids = result[:messages].map(&:first)
         removed = @uids - new_uids
         added = new_uids - @uids
@@ -804,6 +1019,12 @@ module MailOnRails
         @uids = new_uids
         @flags = result[:messages].to_h { |uid, flags| [ uid, flags ] }
         untagged "#{@uids.length} EXISTS" if removed.any? || added.any?
+
+        @uids.each_with_index do |uid, idx|
+          next unless old_flags.key?(uid) && old_flags[uid].sort != @flags[uid].sort
+
+          untagged "#{idx + 1} FETCH (FLAGS (#{@flags[uid].join(" ")}))"
+        end
       end
     end
   end

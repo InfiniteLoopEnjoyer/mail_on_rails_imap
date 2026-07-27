@@ -84,6 +84,50 @@ module MailOnRails
             assert_equal :exists, store.create_mailbox(account_id, "inbox")[:code]
           end
 
+          def test_delete_mailbox_removes_it
+            store.create_mailbox(account_id, "Zed")
+            store.append(account_id, "Zed", RAW_CRLF, [], nil)
+            assert_empty store.delete_mailbox(account_id, "Zed")
+            refute_includes store.list_mailboxes(account_id)[:mailboxes], "Zed"
+            assert_equal :notfound, store.delete_mailbox(account_id, "Zed")[:code]
+          end
+
+          def test_rename_mailbox_renames_children_and_keeps_messages
+            store.create_mailbox(account_id, "Work")
+            store.create_mailbox(account_id, "Work/2025")
+            uid = store.append(account_id, "Work", RAW_CRLF, [], nil)[:uid]
+
+            assert_empty store.rename_mailbox(account_id, "Work", "Job")
+            names = store.list_mailboxes(account_id)[:mailboxes]
+            assert_includes names, "Job"
+            assert_includes names, "Job/2025"
+            refute_includes names, "Work"
+            assert_equal [ uid ], store.select_mailbox(account_id, "Job")[:messages].map(&:first)
+          end
+
+          def test_rename_mailbox_rejects_missing_source_and_existing_target
+            store.create_mailbox(account_id, "A")
+            assert_equal :notfound, store.rename_mailbox(account_id, "Nope", "B")[:code]
+            assert_equal :exists, store.rename_mailbox(account_id, "A", "Trash")[:code]
+          end
+
+          def test_move_transfers_messages_with_fresh_uids
+            uid = store.append(account_id, "INBOX", RAW_CRLF, [ "\\Seen" ], nil)[:uid]
+            mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
+
+            assert_equal :notfound, store.move(mailbox_id, [ uid ], "Nope")[:code]
+
+            result = store.move(mailbox_id, [ uid ], "Trash")
+            assert_equal [ uid ], result[:src_uids]
+            assert_equal 1, result[:dest_uids].size
+            assert_equal [], store.select_mailbox(account_id, "INBOX")[:messages]
+
+            trash_id = store.select_mailbox(account_id, "Trash")[:mailbox_id]
+            moved = store.fetch(trash_id, result[:dest_uids], true)[:messages].first
+            assert_equal RAW_CRLF, moved[:raw]
+            assert_equal [ "\\Seen" ], moved[:flags]
+          end
+
           def test_select_mailbox_shape_and_inbox_case_insensitivity
             result = store.select_mailbox(account_id, "inbox")
             assert result[:mailbox_id]
@@ -154,6 +198,19 @@ module MailOnRails
             assert_equal [ doomed ], store.expunge(mailbox_id)[:uids]
             assert_equal [ keep ], store.select_mailbox(account_id, "INBOX")[:messages].map(&:first)
             assert_equal [], store.expunge(mailbox_id)[:uids]
+          end
+
+          def test_expunge_with_uids_removes_only_listed_deleted_messages
+            first = store.append(account_id, "INBOX", RAW_CRLF, [ "\\Deleted" ], nil)[:uid]
+            second = store.append(account_id, "INBOX", RAW_CRLF, [ "\\Deleted" ], nil)[:uid]
+            undeleted = store.append(account_id, "INBOX", RAW_CRLF, [], nil)[:uid]
+            mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
+
+            # Only \Deleted messages in the list go; an undeleted uid in the
+            # list is ignored, an unlisted \Deleted one survives.
+            assert_equal [ first ], store.expunge(mailbox_id, [ first, undeleted ])[:uids]
+            assert_equal [ second, undeleted ],
+                         store.select_mailbox(account_id, "INBOX")[:messages].map(&:first)
           end
 
           def test_status_counts_messages_and_unseen

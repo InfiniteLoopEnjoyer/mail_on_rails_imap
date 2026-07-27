@@ -53,6 +53,14 @@ module MailOnRails
           op(:create_mailbox, account_id: account_id, name: name)
         end
 
+        def delete_mailbox(account_id, name)
+          op(:delete_mailbox, account_id: account_id, name: name)
+        end
+
+        def rename_mailbox(account_id, from, to)
+          op(:rename_mailbox, account_id: account_id, from: from, to: to)
+        end
+
         def select_mailbox(account_id, name)
           op(:select_mailbox, account_id: account_id, name: name)
         end
@@ -69,8 +77,8 @@ module MailOnRails
           op(:store_flags, mailbox_id: mailbox_id, uids: uids, mode: mode, flags: flags)
         end
 
-        def expunge(mailbox_id)
-          op(:expunge, mailbox_id: mailbox_id)
+        def expunge(mailbox_id, uids = nil)
+          op(:expunge, mailbox_id: mailbox_id, uids: uids)
         end
 
         def append(account_id, mailbox_name, raw, flags, internal_date_epoch)
@@ -81,6 +89,10 @@ module MailOnRails
 
         def copy(mailbox_id, uids, dest_name)
           op(:copy, mailbox_id: mailbox_id, uids: uids, dest_name: dest_name)
+        end
+
+        def move(mailbox_id, uids, dest_name)
+          op(:move, mailbox_id: mailbox_id, uids: uids, dest_name: dest_name)
         end
 
         private
