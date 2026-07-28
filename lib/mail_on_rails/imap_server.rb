@@ -25,7 +25,7 @@ module MailOnRails
   # encrypted (LOGINDISABLED advertised in the clear).
   class ImapServer < Imap::Server
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID"
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE"
     FLAGS = "\\Answered \\Flagged \\Deleted \\Seen \\Draft"
     MAX_LITERAL_BYTES = 30 * 1024 * 1024
     # How often an idling session re-checks the store for changes. The
@@ -515,8 +515,16 @@ module MailOnRails
       }.freeze
 
       def list(tag, args, verb:)
-        ref, pattern = args
+        ref, pattern = args.shift(2)
         return tagged(tag, "BAD #{verb} expects 2 arguments") if pattern.nil?
+
+        status_items = nil
+        if args.first.is_a?(String) && args.first.casecmp?("RETURN")
+          return tagged(tag, "BAD #{verb} does not take RETURN options") unless verb == "LIST"
+
+          status_items = parse_list_return(args)
+          return tagged(tag, "BAD #{status_items}") if status_items.is_a?(String)
+        end
 
         if pattern.empty?
           untagged %(#{verb} (\\Noselect) "/" "")
@@ -527,9 +535,39 @@ module MailOnRails
             next unless name.match?(regex)
 
             untagged %(#{verb} (#{list_attributes(name, names)}) "/" #{Mime.quote(Imap::Utf7.encode(name))})
+            emit_status(name, status_items) if status_items
           end
         end
         tagged tag, "OK #{verb} completed"
+      end
+
+      # Parses "RETURN (STATUS (attrs...))" (RFC 5819) off the LIST
+      # argument list. Returns the STATUS attribute names, nil when the
+      # RETURN list is empty, or a String error for a BAD reply - unknown
+      # return options must be rejected, not ignored (RFC 5258 §3).
+      def parse_list_return(args)
+        args.shift # RETURN
+        return "LIST RETURN expects an option list" unless args.shift == :lparen
+
+        items = nil
+        until args.first == :rparen
+          option = args.shift
+          return "LIST RETURN expects an option list" if option.nil?
+
+          if option.is_a?(String) && option.casecmp?("STATUS") && args.first == :lparen
+            args.shift
+            items = []
+            items << args.shift.to_s.upcase until args.first == :rparen || args.empty?
+            args.shift
+            return "STATUS expects at least one attribute" if items.empty?
+            if (unknown = items.find { |i| !STATUS_ATTRS.include?(i) })
+              return "Unknown STATUS attribute #{unknown}"
+            end
+          else
+            return "Unknown LIST RETURN option #{option}"
+          end
+        end
+        items
       end
 
       def list_attributes(name, names)
@@ -647,6 +685,8 @@ module MailOnRails
         tagged tag, "OK RENAME completed"
       end
 
+      STATUS_ATTRS = %w[MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ SIZE].freeze
+
       def status(tag, args)
         name = Imap::Utf7.decode(args.shift.to_s)
         # The attribute list is mandatory and non-empty per the grammar,
@@ -655,30 +695,36 @@ module MailOnRails
 
         items = args.select { |a| a.is_a?(String) }.map(&:upcase)
         return tagged(tag, "BAD STATUS expects at least one attribute") if items.empty?
-
-        values = {
-          "MESSAGES" => nil, "RECENT" => 0, "UNSEEN" => nil,
-          "UIDNEXT" => nil, "UIDVALIDITY" => nil, "HIGHESTMODSEQ" => nil
-        }
-        if (unknown = items.find { |i| !values.key?(i) })
+        if (unknown = items.find { |i| !STATUS_ATTRS.include?(i) })
           return tagged(tag, "BAD Unknown STATUS attribute #{unknown}")
         end
 
-        # STATUS (HIGHESTMODSEQ) is a CONDSTORE enabling command (RFC 7162 §3.1).
+        return tagged(tag, "NO [NONEXISTENT] STATUS failed: no such mailbox") unless emit_status(name, items)
+
+        tagged tag, "OK STATUS completed"
+      end
+
+      # Sends the untagged STATUS line for +name+; false when the mailbox
+      # doesn't exist. Shared between STATUS and LIST RETURN (STATUS ...)
+      # (RFC 5819). STATUS (HIGHESTMODSEQ) in either form is a CONDSTORE
+      # enabling command (RFC 7162 §3.1).
+      def emit_status(name, items)
         @condstore = true if items.include?("HIGHESTMODSEQ")
         result = @store.status(@account_id, name)
-        return tagged(tag, "NO [NONEXISTENT] STATUS failed: no such mailbox") if result[:error]
+        return false if result[:error]
 
-        values.merge!(
+        values = {
           "MESSAGES" => result[:messages],
+          "RECENT" => 0,
           "UNSEEN" => result[:unseen],
           "UIDNEXT" => result[:uid_next],
           "UIDVALIDITY" => result[:uid_validity],
-          "HIGHESTMODSEQ" => result[:highest_modseq] || 1
-        )
+          "HIGHESTMODSEQ" => result[:highest_modseq] || 1,
+          "SIZE" => result[:size] || 0
+        }
         pairs = items.map { |i| "#{i} #{values[i]}" }
         untagged "STATUS #{Mime.quote(Imap::Utf7.encode(name))} (#{pairs.join(" ")})"
-        tagged tag, "OK STATUS completed"
+        true
       end
 
       def select(tag, args, read_only:)

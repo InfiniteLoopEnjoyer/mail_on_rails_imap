@@ -235,6 +235,15 @@ module MailOnRails
             assert_operator store.status(account_id, "INBOX")[:highest_modseq], :>, before
           end
 
+          def test_status_reports_total_message_size
+            assert_equal 0, store.status(account_id, "INBOX")[:size]
+
+            store.append(account_id, "INBOX", RAW_CRLF, [], nil)
+            store.append(account_id, "INBOX", RAW_BARE_LF, [], nil) # normalized to CRLF size
+            assert_equal 2 * RAW_CRLF.bytesize, store.status(account_id, "INBOX")[:size],
+                         "STATUS=SIZE needs the summed message sizes"
+          end
+
           def test_expunge_reports_the_updated_highest_modseq
             store.append(account_id, "INBOX", RAW_CRLF, [ "\\Deleted" ], nil)
             mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]

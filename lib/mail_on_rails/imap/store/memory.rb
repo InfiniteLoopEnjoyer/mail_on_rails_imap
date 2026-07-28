@@ -155,7 +155,8 @@ module MailOnRails
               unseen: mailbox[:messages].count { |m| !m[:flags].include?("\\Seen") },
               uid_next: mailbox[:uid_next],
               uid_validity: mailbox[:uid_validity],
-              highest_modseq: mailbox[:highest_modseq]
+              highest_modseq: mailbox[:highest_modseq],
+              size: mailbox[:messages].sum { |m| m[:size] }
             }
           end
         end
