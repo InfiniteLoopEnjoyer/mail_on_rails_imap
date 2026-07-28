@@ -53,10 +53,17 @@ Rule: every item lands with tests.
 - [x] Keyword flags end-to-end tests (STORE/FETCH/SEARCH KEYWORD round trip)
 - [x] Bonus fix found by testing: APPEND into the selected mailbox now
       announces untagged EXISTS before the tagged OK (RFC 3501 §6.3.11)
-- [ ] CONDSTORE/QRESYNC — needs a modseq column in the Rails store, modseq
-      bump on every flag write/append/expunge, HIGHESTMODSEQ in SELECT/STATUS,
-      FETCH CHANGEDSINCE / STORE UNCHANGEDSINCE / SEARCH MODSEQ, VANISHED.
-      Largest remaining item; touches all four store layers + a migration.
+- [x] CONDSTORE (RFC 7162) — DONE 2026-07-27: per-mailbox highest_modseq +
+      per-message modseq in every store layer (Rails migration
+      20260727220000, Mailbox#claim_modseq!, EmailMessage hooks on
+      create/flag-update/destroy); SELECT (CONDSTORE) + HIGHESTMODSEQ,
+      FETCH MODSEQ / CHANGEDSINCE, STORE UNCHANGEDSINCE + [MODIFIED],
+      SEARCH MODSEQ with (MODSEQ n) response, STATUS HIGHESTMODSEQ
+      (requested-only). Verified via net-imap's condstore:/changedsince:/
+      unchangedsince: APIs.
+- [ ] QRESYNC — needs expunged-UID tombstones (uid+modseq log) for
+      VANISHED (EARLIER), ENABLE QRESYNC, SELECT QRESYNC params. Next
+      logical step after CONDSTORE; requires a new table or expunge log.
 - [ ] AUTH=SCRAM-SHA-256 — server needs per-account salt/iterations/
       StoredKey/ServerKey, derived at password-set time in the Rails app
       (bcrypt hash alone can't do SCRAM). New store op to fetch SCRAM creds.

@@ -112,7 +112,8 @@ module MailOnRails
               name: mailbox[:name],
               uid_validity: mailbox[:uid_validity],
               uid_next: mailbox[:uid_next],
-              messages: sorted(mailbox).map { |m| [ m[:uid], m[:flags].dup ] }
+              highest_modseq: mailbox[:highest_modseq],
+              messages: sorted(mailbox).map { |m| [ m[:uid], m[:flags].dup, m[:modseq] ] }
             }
           end
         end
@@ -127,7 +128,8 @@ module MailOnRails
               messages: mailbox[:messages].size,
               unseen: mailbox[:messages].count { |m| !m[:flags].include?("\\Seen") },
               uid_next: mailbox[:uid_next],
-              uid_validity: mailbox[:uid_validity]
+              uid_validity: mailbox[:uid_validity],
+              highest_modseq: mailbox[:highest_modseq]
             }
           end
         end
@@ -137,7 +139,8 @@ module MailOnRails
             mailbox = mailbox_by_id(mailbox_id)
             messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
             entries = messages.map do |m|
-              entry = { uid: m[:uid], flags: m[:flags].dup, internal_date: m[:internal_date].to_i, size: m[:size] }
+              entry = { uid: m[:uid], flags: m[:flags].dup, internal_date: m[:internal_date].to_i,
+                        size: m[:size], modseq: m[:modseq] }
               entry[:raw] = m[:raw] if with_raw
               entry
             end
@@ -156,7 +159,8 @@ module MailOnRails
                 when "-" then (m[:flags] - flags)
                 else flags.dup
                 end
-              [ m[:uid], m[:flags].dup ]
+              m[:modseq] = next_modseq(mailbox)
+              [ m[:uid], m[:flags].dup, m[:modseq] ]
             end
             { messages: updated }
           end
@@ -173,6 +177,7 @@ module MailOnRails
               m[:flags].include?("\\Deleted") && (uids.nil? || uids.include?(m[:uid]))
             end
             mailbox[:messages] = kept
+            next_modseq(mailbox) if doomed.any?
             { uids: doomed.map { |m| m[:uid] }.sort }
           end
         end
@@ -229,6 +234,7 @@ module MailOnRails
               dest_uids << copied[:uid]
             end
             source[:messages] = source[:messages].reject { |m| src_uids.include?(m[:uid]) }
+            next_modseq(source) if src_uids.any?
             { uid_validity: dest[:uid_validity], src_uids: src_uids, dest_uids: dest_uids }
           end
         end
@@ -244,7 +250,14 @@ module MailOnRails
         end
 
         def new_mailbox(name)
-          { id: next_id(:mailbox), name: name, uid_validity: Time.now.to_i, uid_next: 1, messages: [] }
+          { id: next_id(:mailbox), name: name, uid_validity: Time.now.to_i, uid_next: 1,
+            highest_modseq: 1, messages: [] }
+        end
+
+        # Every mutation of a mailbox's contents gets the next per-mailbox
+        # mod-sequence (RFC 7162 CONDSTORE).
+        def next_modseq(mailbox)
+          mailbox[:highest_modseq] += 1
         end
 
         # INBOX is matched case-insensitively (RFC 3501); other names exactly.
@@ -272,7 +285,8 @@ module MailOnRails
             raw: normalized,
             size: normalized.bytesize,
             flags: flags,
-            internal_date: internal_date
+            internal_date: internal_date,
+            modseq: next_modseq(mailbox)
           }
           mailbox[:uid_next] += 1
           mailbox[:messages] << message

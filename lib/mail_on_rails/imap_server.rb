@@ -22,7 +22,7 @@ module MailOnRails
   # encrypted (LOGINDISABLED advertised in the clear).
   class ImapServer < Imap::Server
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN ID"
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ID"
     FLAGS = "\\Answered \\Flagged \\Deleted \\Seen \\Draft"
     MAX_LITERAL_BYTES = 30 * 1024 * 1024
     # How often an idling session re-checks the store for changes. The
@@ -104,6 +104,12 @@ module MailOnRails
         @selected = nil
         @uids = []
         @flags = {}
+        @modseqs = {}
+        @highest_modseq = 1
+        # Once a client uses any CONDSTORE-enabling construct (SELECT
+        # (CONDSTORE), FETCH MODSEQ/CHANGEDSINCE, STORE UNCHANGEDSINCE,
+        # SEARCH MODSEQ), MODSEQ rides along in FETCH responses (RFC 7162).
+        @condstore = false
         @read_only = false
         @logout = false
       end
@@ -495,9 +501,11 @@ module MailOnRails
           "RECENT" => 0,
           "UNSEEN" => result[:unseen],
           "UIDNEXT" => result[:uid_next],
-          "UIDVALIDITY" => result[:uid_validity]
+          "UIDVALIDITY" => result[:uid_validity],
+          "HIGHESTMODSEQ" => result[:highest_modseq] || 1
         }
-        items = values.keys if items.empty?
+        # HIGHESTMODSEQ is returned only when asked for (RFC 7162).
+        items = %w[MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY] if items.empty?
         pairs = items.filter_map { |i| "#{i} #{values[i]}" if values.key?(i) }
         untagged "STATUS #{Mime.quote(Imap::Utf7.encode(name))} (#{pairs.join(" ")})"
         tagged tag, "OK STATUS completed"
@@ -505,6 +513,7 @@ module MailOnRails
 
       def select(tag, args, read_only:)
         name = Imap::Utf7.decode(args.first.to_s)
+        @condstore = true if args.any? { |a| a.is_a?(String) && a.casecmp?("CONDSTORE") }
         result = @store.select_mailbox(@account_id, name)
         if result[:error]
           @selected = nil
@@ -513,8 +522,7 @@ module MailOnRails
 
         @selected = { mailbox_id: result[:mailbox_id], name: result[:name] }
         @read_only = read_only
-        @uids = result[:messages].map(&:first)
-        @flags = result[:messages].to_h { |uid, flags| [ uid, flags ] }
+        take_snapshot(result)
 
         untagged "FLAGS (#{FLAGS})"
         untagged "#{@uids.length} EXISTS"
@@ -525,23 +533,36 @@ module MailOnRails
         untagged "OK [PERMANENTFLAGS (#{FLAGS} \\*)] Flags permitted"
         untagged "OK [UIDVALIDITY #{result[:uid_validity]}] UIDs valid"
         untagged "OK [UIDNEXT #{result[:uid_next]}] Predicted next UID"
+        untagged "OK [HIGHESTMODSEQ #{@highest_modseq}] Highest"
         tagged tag, "OK [#{read_only ? "READ-ONLY" : "READ-WRITE"}] #{read_only ? "EXAMINE" : "SELECT"} completed"
+      end
+
+      # Rows are [uid, flags, modseq]; modseq may be absent from a store
+      # that predates CONDSTORE, in which case everything reads as 1.
+      def take_snapshot(result)
+        @uids = result[:messages].map(&:first)
+        @flags = result[:messages].to_h { |uid, flags, _modseq| [ uid, flags ] }
+        @modseqs = result[:messages].to_h { |uid, _flags, modseq| [ uid, modseq || 1 ] }
+        @highest_modseq = result[:highest_modseq] || 1
       end
 
       def close(tag)
         @store.expunge(@selected[:mailbox_id]) unless @read_only
-        @selected = nil
-        @uids = []
-        @flags = {}
+        drop_snapshot
         tagged tag, "OK CLOSE completed"
       end
 
       # RFC 3691: like CLOSE but without the implicit expunge.
       def unselect(tag)
+        drop_snapshot
+        tagged tag, "OK UNSELECT completed"
+      end
+
+      def drop_snapshot
         @selected = nil
         @uids = []
         @flags = {}
-        tagged tag, "OK UNSELECT completed"
+        @modseqs = {}
       end
 
       # Plain EXPUNGE removes every \Deleted message; UID EXPUNGE (UIDPLUS,
@@ -603,18 +624,23 @@ module MailOnRails
         "FULL" => %w[FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY].freeze
       }.freeze
 
-      METADATA_ITEMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE].freeze
+      METADATA_ITEMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ].freeze
 
       def fetch(tag, args, uid_mode)
         set = args.shift
         return tagged(tag, "BAD FETCH expects a sequence set") unless set.is_a?(String)
 
+        changedsince = extract_changedsince(args)
         items = args.take_while { |a| a != :rparen }.reject { |a| a == :lparen }.map { |a| a.to_s }
         items = items.flat_map { |i| FETCH_MACROS[i.upcase] || [ i ] }
         items << "UID" if uid_mode && items.none? { |i| i.casecmp?("UID") }
         return tagged(tag, "BAD FETCH expects data items") if items.empty?
 
+        @condstore = true if changedsince || items.any? { |i| i.casecmp?("MODSEQ") }
+        items << "MODSEQ" if @condstore && items.none? { |i| i.casecmp?("MODSEQ") }
+
         wanted = resolve_set(set, uid_mode)
+        wanted = wanted.select { |_seq, uid| (@modseqs[uid] || 1) > changedsince } if changedsince
         need_raw = items.any? { |i| !METADATA_ITEMS.include?(i.upcase) }
         messages = fetch_messages(wanted.map(&:last), need_raw)
         newly_seen = mark_fetched_seen(items, wanted.filter_map { |_seq, uid| messages[uid] })
@@ -624,6 +650,19 @@ module MailOnRails
           untagged "#{seq} FETCH (#{fetch_items(msg, items, announce_seen: newly_seen.include?(uid)).join(" ")})"
         end
         tagged tag, "OK FETCH completed"
+      end
+
+      # Pulls the RFC 7162 "(CHANGEDSINCE n)" modifier group out of the
+      # argument list (it follows the item list) and returns n, or nil.
+      def extract_changedsince(args)
+        idx = args.index { |a| a.is_a?(String) && a.casecmp?("CHANGEDSINCE") }
+        return nil unless idx
+
+        value = args[idx + 1].to_i
+        first = idx.positive? && args[idx - 1] == :lparen ? idx - 1 : idx
+        last = args[idx + 2] == :rparen ? idx + 2 : idx + 1
+        args.slice!(first..last)
+        value
       end
 
       def fetch_messages(uids, with_raw)
@@ -652,7 +691,10 @@ module MailOnRails
         return [] if uids.empty?
 
         result = @store.store_flags(@selected[:mailbox_id], uids, "+", [ "\\Seen" ])
-        (result[:messages] || []).each { |uid, new_flags| @flags[uid] = new_flags }
+        (result[:messages] || []).each do |uid, new_flags, modseq|
+          @flags[uid] = new_flags
+          @modseqs[uid] = modseq if modseq
+        end
         uids
       end
 
@@ -665,6 +707,7 @@ module MailOnRails
         items.each do |item|
           case item.upcase
           when "UID"           then out << "UID #{msg[:uid]}"
+          when "MODSEQ"        then out << "MODSEQ (#{@modseqs[msg[:uid]] || msg[:modseq] || 1})"
           when "FLAGS"         then out << "FLAGS (#{flags.join(" ")})"
           when "INTERNALDATE"  then out << %(INTERNALDATE "#{internal_date(msg)}")
           when "RFC822.SIZE"   then out << "RFC822.SIZE #{msg[:size]}"
@@ -707,7 +750,16 @@ module MailOnRails
       }.freeze
 
       def store(tag, args, uid_mode)
-        set, item = args.shift(2)
+        set = args.shift
+        unchangedsince = nil
+        # RFC 7162: store-modifier group precedes the item, e.g.
+        # STORE 1:* (UNCHANGEDSINCE 620162338) +FLAGS.SILENT (\Deleted)
+        if args.first == :lparen && args[1].is_a?(String) && args[1].casecmp?("UNCHANGEDSINCE")
+          unchangedsince = args[2].to_i
+          args.shift(4)
+          @condstore = true
+        end
+        item = args.shift
         return tagged(tag, "BAD STORE expects a sequence set and item") unless set.is_a?(String) && item.is_a?(String)
         return tagged(tag, "NO Mailbox is read-only") if @read_only
 
@@ -721,21 +773,40 @@ module MailOnRails
                     .reject { |f| f == "\\Recent" }
 
         wanted = resolve_set(set, uid_mode)
-        return tagged(tag, "OK STORE completed") if wanted.empty?
+        failed = []
+        if unchangedsince
+          wanted, failed = wanted.partition { |_seq, uid| (@modseqs[uid] || 1) <= unchangedsince }
+        end
+        return tagged(tag, store_completion(failed, uid_mode)) if wanted.empty?
 
         result = @store.store_flags(@selected[:mailbox_id], wanted.map(&:last), mode, flags)
-        updated = (result[:messages] || []).to_h { |uid, new_flags| [ uid, new_flags ] }
-        updated.each { |uid, new_flags| @flags[uid] = new_flags }
+        updated = {}
+        (result[:messages] || []).each do |uid, new_flags, modseq|
+          updated[uid] = new_flags
+          @flags[uid] = new_flags
+          @modseqs[uid] = modseq if modseq
+        end
 
         unless silent
           wanted.each do |seq, uid|
             next unless updated.key?(uid)
 
-            uid_part = uid_mode ? " UID #{uid}" : ""
-            untagged "#{seq} FETCH (FLAGS (#{updated[uid].join(" ")})#{uid_part})"
+            parts = [ "FLAGS (#{updated[uid].join(" ")})" ]
+            parts << "MODSEQ (#{@modseqs[uid] || 1})" if @condstore
+            parts << "UID #{uid}" if uid_mode
+            untagged "#{seq} FETCH (#{parts.join(" ")})"
           end
         end
-        tagged tag, "OK STORE completed"
+        tagged tag, store_completion(failed, uid_mode)
+      end
+
+      # RFC 7162: messages skipped by UNCHANGEDSINCE are reported in a
+      # MODIFIED response code on the (still OK) tagged completion.
+      def store_completion(failed, uid_mode)
+        return "OK STORE completed" if failed.empty?
+
+        ids = failed.map { |seq, uid| uid_mode ? uid : seq }
+        "OK [MODIFIED #{compress_set(ids)}] Conditional STORE completed"
       end
 
       def copy(tag, args, uid_mode)
@@ -805,6 +876,7 @@ module MailOnRails
 
       def search(tag, args, uid_mode)
         criteria = args.dup
+        @search_modseq = false
         return_opts = parse_search_return(criteria)
         if criteria.first.is_a?(String) && criteria.first.casecmp?("CHARSET")
           charset = criteria.shift(2)[1].to_s
@@ -835,10 +907,17 @@ module MailOnRails
           end
         end
         ids = hits.map { |seq, uid| uid_mode ? uid : seq }
+        # RFC 7162: a MODSEQ search key adds "(MODSEQ n)" / "MODSEQ n"
+        # (highest modseq among the matches) to the response.
+        modseq_max = @search_modseq && hits.any? ? hits.map { |_seq, uid| @modseqs[uid] || 1 }.max : nil
         if return_opts
-          untagged esearch_response(tag, ids, return_opts, uid_mode)
+          response = esearch_response(tag, ids, return_opts, uid_mode)
+          response << " MODSEQ #{modseq_max}" if modseq_max
+          untagged response
         else
-          untagged "SEARCH #{ids.join(" ")}".rstrip
+          response = +"SEARCH #{ids.join(" ")}".rstrip
+          response << " (MODSEQ #{modseq_max})" if modseq_max
+          untagged response
         end
         tagged tag, "OK SEARCH completed"
       rescue SearchSyntaxError => e
@@ -956,6 +1035,14 @@ module MailOnRails
           raw_key { |_seq, msg| Mime.split_header(msg[:raw].to_s)[1].downcase.include?(value) }
         when "OLDER"   then age_key(toks.shift) { |age, seconds| age >= seconds }
         when "YOUNGER" then age_key(toks.shift) { |age, seconds| age <= seconds }
+        when "MODSEQ"
+          # Optional entry-name/entry-type prefix ("/flags/\Seen" all) is
+          # accepted and ignored - flags share one modseq per message here.
+          toks.shift(2) if toks.first.is_a?(String) && !toks.first.match?(/\A\d+\z/)
+          value = toks.shift.to_s.to_i
+          @condstore = true
+          @search_modseq = true
+          meta_key { |_seq, msg| (@modseqs[msg[:uid]] || 1) >= value }
         when /\A[\d*][\d,:*]*\z/
           pairs = resolve_set(tok, false)
           seqs = pairs.map(&:first)
@@ -1110,8 +1197,7 @@ module MailOnRails
         @uids.each_with_index.to_a.reverse_each do |uid, idx|
           untagged "#{idx + 1} EXPUNGE" if removed.include?(uid)
         end
-        @uids = new_uids
-        @flags = result[:messages].to_h { |uid, flags| [ uid, flags ] }
+        take_snapshot(result)
         untagged "#{@uids.length} EXISTS" if removed.any? || added.any?
 
         @uids.each_with_index do |uid, idx|

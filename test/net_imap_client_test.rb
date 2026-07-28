@@ -124,6 +124,32 @@ class NetImapClientTest < Minitest::Test
     end
   end
 
+  def test_condstore_select_fetch_and_conditional_store
+    with_client do |imap|
+      imap.authenticate("PLAIN", EMAIL, PASSWORD)
+      imap.select("INBOX", condstore: true)
+      assert_kind_of Integer, imap.responses("HIGHESTMODSEQ", &:last)
+
+      baseline = imap.fetch(1, %w[FLAGS MODSEQ]).first.modseq
+      assert_kind_of Integer, baseline
+
+      applied = imap.store(1, "+FLAGS", [ :Flagged ], unchangedsince: baseline)
+      refute_empty applied
+      bumped = imap.fetch(1, "MODSEQ").first.modseq
+      assert_operator bumped, :>, baseline
+
+      # Stale UNCHANGEDSINCE: nothing applied, flag stays put.
+      stale = imap.store(1, "+FLAGS", [ :Draft ], unchangedsince: baseline)
+      assert stale.nil? || stale.empty?
+      refute_includes imap.fetch(1, "FLAGS").first.attr["FLAGS"], :Draft
+
+      changed = imap.fetch(1..-1, "FLAGS", changedsince: baseline)
+      assert_equal [ 1 ], changed.map(&:seqno)
+      unchanged = imap.fetch(1..-1, "FLAGS", changedsince: bumped)
+      assert unchanged.nil? || unchanged.empty?
+    end
+  end
+
   def test_idle_receives_exists_update
     poll = MailOnRails::ImapServer::IDLE_POLL_SECONDS
     MailOnRails::ImapServer.send(:remove_const, :IDLE_POLL_SECONDS)

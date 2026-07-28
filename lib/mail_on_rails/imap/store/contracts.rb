@@ -147,7 +147,34 @@ module MailOnRails
 
             result = store.select_mailbox(account_id, "INBOX")
             assert_equal 3, result[:uid_next]
-            assert_equal [ [ 1, [] ], [ 2, [ "\\Seen" ] ] ], result[:messages]
+            assert_equal [ [ 1, [] ], [ 2, [ "\\Seen" ] ] ],
+                         result[:messages].map { |uid, flags, _modseq| [ uid, flags ] }
+          end
+
+          def test_modseq_tracks_mutations_and_highest_modseq
+            store.append(account_id, "INBOX", RAW_CRLF, [], nil)
+            store.append(account_id, "INBOX", RAW_CRLF, [], nil)
+
+            result = store.select_mailbox(account_id, "INBOX")
+            modseqs = result[:messages].map(&:last)
+            assert modseqs.all? { |m| m.is_a?(Integer) && m.positive? }, "per-message modseq required"
+            assert_equal modseqs, modseqs.sort, "modseq must be ascending with delivery order"
+            assert_operator result[:highest_modseq], :>=, modseqs.max
+
+            mailbox_id = result[:mailbox_id]
+            before = result[:highest_modseq]
+            updated = store.store_flags(mailbox_id, [ 1 ], "+", [ "\\Seen" ])[:messages].first
+            assert_operator updated[2], :>, before, "flag change must advance the message's modseq"
+
+            after = store.select_mailbox(account_id, "INBOX")
+            assert_operator after[:highest_modseq], :>=, updated[2]
+            assert_equal after[:highest_modseq], store.status(account_id, "INBOX")[:highest_modseq]
+
+            store.store_flags(mailbox_id, [ 2 ], "+", [ "\\Deleted" ])
+            highest = store.status(account_id, "INBOX")[:highest_modseq]
+            store.expunge(mailbox_id)
+            assert_operator store.status(account_id, "INBOX")[:highest_modseq], :>, highest,
+                            "expunge must advance HIGHESTMODSEQ"
           end
 
           def test_append_to_unknown_mailbox_is_notfound
@@ -182,12 +209,13 @@ module MailOnRails
             uid = store.append(account_id, "INBOX", RAW_CRLF, [ "\\Seen" ], nil)[:uid]
             mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
 
+            without_modseq = ->(result) { result[:messages].map { |u, flags, _modseq| [ u, flags ] } }
             assert_equal [ [ uid, [ "\\Seen", "\\Flagged" ] ] ],
-                         store.store_flags(mailbox_id, [ uid ], "+", [ "\\Flagged" ])[:messages]
+                         without_modseq.call(store.store_flags(mailbox_id, [ uid ], "+", [ "\\Flagged" ]))
             assert_equal [ [ uid, [ "\\Flagged" ] ] ],
-                         store.store_flags(mailbox_id, [ uid ], "-", [ "\\Seen" ])[:messages]
+                         without_modseq.call(store.store_flags(mailbox_id, [ uid ], "-", [ "\\Seen" ]))
             assert_equal [ [ uid, [ "\\Draft" ] ] ],
-                         store.store_flags(mailbox_id, [ uid ], "=", [ "\\Draft" ])[:messages]
+                         without_modseq.call(store.store_flags(mailbox_id, [ uid ], "=", [ "\\Draft" ]))
           end
 
           def test_expunge_removes_only_deleted_flagged_messages

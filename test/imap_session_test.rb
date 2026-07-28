@@ -323,10 +323,73 @@ class ImapSessionTest < Minitest::Test
   def test_capabilities_advertise_new_extensions
     with_session do |client|
       greeting = client.gets("\r\n")
-      %w[IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN UIDPLUS LITERAL\+ SASL-IR].each do |cap|
+      %w[IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE UIDPLUS LITERAL\+ SASL-IR].each do |cap|
         assert_match(/#{cap}/, greeting)
       end
       command(client, "g1", "LOGOUT")
+    end
+  end
+
+  def test_condstore_select_status_and_fetch_modseq
+    with_session do |client|
+      client.gets("\r\n")
+      command(client, "c1", "LOGIN #{EMAIL} #{PASSWORD}")
+      select = command(client, "c2", "SELECT INBOX (CONDSTORE)")
+      assert_match(/\* OK \[HIGHESTMODSEQ \d+\]/, select)
+
+      assert_match(/HIGHESTMODSEQ \d+/, command(client, "c3", "STATUS INBOX (MESSAGES HIGHESTMODSEQ)"))
+      refute_match(/HIGHESTMODSEQ/, command(client, "c4", "STATUS INBOX ()"), "default STATUS omits HIGHESTMODSEQ")
+
+      assert_match(/\* 1 FETCH \(MODSEQ \(\d+\)\)/, command(client, "c5", "FETCH 1 (MODSEQ)"))
+      # CONDSTORE is now enabled for the session: plain FETCHes carry MODSEQ too.
+      assert_match(/MODSEQ \(\d+\)/, command(client, "c6", "FETCH 1 (FLAGS)"))
+      command(client, "c7", "LOGOUT")
+    end
+  end
+
+  def fetch_modseq(client, tag, seq)
+    command(client, tag, "FETCH #{seq} (MODSEQ)")[/MODSEQ \((\d+)\)/, 1].to_i
+  end
+
+  def test_store_unchangedsince_applies_and_reports_modified
+    with_session do |client|
+      login_and_select(client)
+      baseline = fetch_modseq(client, "u1", 1)
+
+      fresh = command(client, "u2", "STORE 1 (UNCHANGEDSINCE #{baseline}) +FLAGS (\\Flagged)")
+      assert_match(/\A\* 1 FETCH \(FLAGS \([^)]*\\Flagged[^)]*\) MODSEQ \(\d+\)\)\r\nu2 OK STORE completed/, fresh)
+
+      # baseline is stale now: the store must be refused with MODIFIED.
+      stale = command(client, "u3", "STORE 1 (UNCHANGEDSINCE #{baseline}) +FLAGS (\\Draft)")
+      assert_match(/\Au3 OK \[MODIFIED 1\] Conditional STORE completed/, stale)
+      refute_match(/\\Draft/, command(client, "u4", "FETCH 1 (FLAGS)"))
+      command(client, "u5", "LOGOUT")
+    end
+  end
+
+  def test_fetch_changedsince_returns_only_newer_messages
+    @store.append(@account_id, "INBOX", RAW, [], nil) # uid 2
+    with_session do |client|
+      login_and_select(client)
+      baseline = fetch_modseq(client, "f1", 2)
+      command(client, "f2", "STORE 1 +FLAGS.SILENT (\\Flagged)")
+
+      changed = command(client, "f3", "UID FETCH 1:* (FLAGS) (CHANGEDSINCE #{baseline})")
+      assert_match(/\* 1 FETCH \(.*MODSEQ \(\d+\)/, changed)
+      refute_match(/\* 2 FETCH/, changed, "unchanged message must be filtered by CHANGEDSINCE")
+      command(client, "f4", "LOGOUT")
+    end
+  end
+
+  def test_search_modseq_key_appends_highest_match_modseq
+    with_session do |client|
+      login_and_select(client)
+      modseq = fetch_modseq(client, "m1", 1)
+      assert_match(/\A\* SEARCH 1 \(MODSEQ #{modseq}\)\r\n/, command(client, "m2", "SEARCH MODSEQ 1"))
+      assert_match(/\A\* SEARCH\r\n/, command(client, "m3", "SEARCH MODSEQ #{modseq + 1000}"))
+      esearch = command(client, "m4", "SEARCH RETURN (ALL) MODSEQ 1")
+      assert_match(/\A\* ESEARCH \(TAG "m4"\) ALL 1 MODSEQ #{modseq}\r\n/, esearch)
+      command(client, "m5", "LOGOUT")
     end
   end
 
