@@ -44,7 +44,13 @@ env:
     # database env in this container.
     - MAIL_ON_RAILS_INTERNAL_API_PASSWORD
   clear:
-    # Every store operation goes to the app's private API.
+    # Every store operation goes to the app's private API. When both
+    # containers share a docker network, prefer plain HTTP to a stable
+    # network-alias on the app container (traffic never leaves the host,
+    # and the daemon stops depending on the proxy and its certs):
+    #   http://mail_on_rails-web/mail_on_rails/internal
+    # Rails with config.assume_ssl treats the direct call as SSL, so no
+    # force_ssl redirect fires.
     MAIL_ON_RAILS_INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
 
     # TLS material for the listeners (e.g. Let's Encrypt). Renewals are
