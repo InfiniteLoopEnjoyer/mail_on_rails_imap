@@ -10,3 +10,6 @@
 
 /.bundle/
 /tmp/
+
+# Local RFC reference texts (fetch via docs/rfcs - see INDEX.md) - not committed.
+/docs/rfcs/*.txt
