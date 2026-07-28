@@ -216,6 +216,37 @@ module MailOnRails
                             "expunge must advance HIGHESTMODSEQ"
           end
 
+          def test_store_flags_matches_case_insensitively_and_skips_noop_modseq
+            uid = store.append(account_id, "INBOX", RAW_CRLF, [ "custom1" ], nil)[:uid]
+            mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
+            before = store.status(account_id, "INBOX")[:highest_modseq]
+
+            # Flags are case-insensitive atoms: a case-variant add changes
+            # nothing, and a store that changes nothing must not claim a
+            # new modseq (clients would re-sync unchanged messages).
+            result = store.store_flags(mailbox_id, [ uid ], "+", [ "Custom1" ])
+            assert_equal [ "custom1" ], result[:messages].first[1]
+            assert_equal before, store.status(account_id, "INBOX")[:highest_modseq],
+                         "no-op flag store must not advance HIGHESTMODSEQ"
+
+            # A case-variant removal still matches the stored flag.
+            result = store.store_flags(mailbox_id, [ uid ], "-", [ "CUSTOM1" ])
+            assert_equal [], result[:messages].first[1]
+            assert_operator store.status(account_id, "INBOX")[:highest_modseq], :>, before
+          end
+
+          def test_expunge_reports_the_updated_highest_modseq
+            store.append(account_id, "INBOX", RAW_CRLF, [ "\\Deleted" ], nil)
+            mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
+            before = store.status(account_id, "INBOX")[:highest_modseq]
+
+            # The IMAP server needs the post-expunge value for the
+            # RFC 7162 HIGHESTMODSEQ response code on the tagged OK.
+            result = store.expunge(mailbox_id)
+            assert_operator result[:highest_modseq], :>, before
+            assert_equal store.status(account_id, "INBOX")[:highest_modseq], result[:highest_modseq]
+          end
+
           def test_append_to_unknown_mailbox_is_notfound
             assert_equal :notfound, store.append(account_id, "Nope", RAW_CRLF, [], nil)[:code]
           end
