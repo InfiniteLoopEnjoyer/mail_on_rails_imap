@@ -309,7 +309,11 @@ class ImapSessionTest < Minitest::Test
       refute_includes list, "Projects"
 
       assert_match(/\Ad5 NO Cannot delete INBOX/, command(client, "d5", "DELETE INBOX"))
-      assert_match(/\Ad6 NO Cannot rename INBOX/, command(client, "d6", "RENAME INBOX Elsewhere"))
+      # RFC 3501 §6.3.5: renaming INBOX moves its messages to the new
+      # mailbox and leaves an empty INBOX behind.
+      assert_match(/\Ad6 OK/, command(client, "d6", "RENAME INBOX Elsewhere"))
+      assert_match(/MESSAGES 1/, command(client, "e1", "STATUS Elsewhere (MESSAGES)"))
+      assert_match(/MESSAGES 0/, command(client, "e2", "STATUS INBOX (MESSAGES)"))
       assert_match(/\Ad7 OK/, command(client, "d7", "DELETE Work/2026"))
       refute_includes command(client, "d8", "LIST \"\" *"), "2026"
       command(client, "d9", "LOGOUT")
@@ -372,7 +376,7 @@ class ImapSessionTest < Minitest::Test
       assert_match(/\* OK \[HIGHESTMODSEQ \d+\]/, select)
 
       assert_match(/HIGHESTMODSEQ \d+/, command(client, "c3", "STATUS INBOX (MESSAGES HIGHESTMODSEQ)"))
-      refute_match(/HIGHESTMODSEQ/, command(client, "c4", "STATUS INBOX ()"), "default STATUS omits HIGHESTMODSEQ")
+      refute_match(/HIGHESTMODSEQ/, command(client, "c4", "STATUS INBOX (MESSAGES)"), "STATUS omits HIGHESTMODSEQ unless requested")
 
       assert_match(/\* 1 FETCH \(MODSEQ \(\d+\)\)/, command(client, "c5", "FETCH 1 (MODSEQ)"))
       # CONDSTORE is now enabled for the session: plain FETCHes carry MODSEQ too.

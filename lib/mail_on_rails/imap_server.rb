@@ -297,7 +297,7 @@ module MailOnRails
         when "APPEND"       then require_auth(tag) { append(tag, args) }
         when "CLOSE"        then require_selected(tag) { close(tag) }
         when "UNSELECT"     then require_selected(tag) { unselect(tag) }
-        when "EXPUNGE"      then require_selected(tag) { expunge(tag, uid_mode ? args : nil) }
+        when "EXPUNGE"      then require_selected(tag) { expunge(tag, args, uid_mode) }
         when "FETCH"        then require_selected(tag) { fetch(tag, args, uid_mode) }
         when "STORE"        then require_selected(tag) { store(tag, args, uid_mode) }
         when "COPY"         then require_selected(tag) { copy(tag, args, uid_mode) }
@@ -558,12 +558,40 @@ module MailOnRails
       def create(tag, args)
         name = Imap::Utf7.decode(args.first.to_s)
         return tagged(tag, "BAD CREATE expects a mailbox name") if name.empty?
+        if (error = mailbox_name_error(name))
+          return tagged(tag, error.start_with?("BAD") ? error : "NO CREATE failed: #{error}")
+        end
 
+        # A trailing hierarchy separator only declares the intent to
+        # create children under the name (RFC 3501 §6.3.3).
+        name = name.chomp("/")
+        create_missing_parents(name)
         result = @store.create_mailbox(@account_id, name)
         if result[:error]
-          tagged tag, "NO CREATE failed: #{result[:error]}"
+          tagged tag, "NO #{result[:code] == :exists ? "[ALREADYEXISTS] " : ""}CREATE failed: #{result[:error]}"
         else
           tagged tag, "OK CREATE completed"
+        end
+      end
+
+      # BAD for names no client should ever send (control characters);
+      # a plain error string for structurally invalid hierarchy.
+      def mailbox_name_error(name)
+        return "BAD CREATE mailbox name contains control characters" if name.match?(/[\x00-\x1f\x7f]/)
+        return "invalid mailbox name" if name.start_with?("/") || name.include?("//")
+
+        nil
+      end
+
+      # RFC 3501 §6.3.3/§6.3.5: a name with hierarchy separators SHOULD
+      # cause any missing superior names to be created too.
+      def create_missing_parents(name)
+        existing = mailbox_names
+        prefix = +""
+        name.split("/")[0..-2].each do |component|
+          prefix << "/" unless prefix.empty?
+          prefix << component
+          @store.create_mailbox(@account_id, prefix.dup) unless existing.include?(prefix)
         end
       end
 
@@ -574,7 +602,7 @@ module MailOnRails
 
         result = @store.delete_mailbox(@account_id, name)
         if result[:error]
-          tagged tag, "NO DELETE failed: #{result[:error]}"
+          tagged tag, "NO #{result[:code] == :notfound ? "[NONEXISTENT] " : ""}DELETE failed: #{result[:error]}"
         else
           tagged tag, "OK DELETE completed"
         end
@@ -583,13 +611,13 @@ module MailOnRails
       def rename(tag, args)
         from, to = args.first(2).map { |a| Imap::Utf7.decode(a.to_s) }
         return tagged(tag, "BAD RENAME expects two mailbox names") if from.empty? || to.to_s.empty?
-        # RFC 3501's special INBOX-rename semantics (move contents, keep
-        # INBOX) are not implemented; refusing is safer than surprising.
-        return tagged(tag, "NO Cannot rename INBOX") if from.casecmp?("INBOX")
+        return rename_inbox(tag, to) if from.casecmp?("INBOX")
 
+        create_missing_parents(to)
         result = @store.rename_mailbox(@account_id, from, to)
         if result[:error]
-          tagged tag, "NO RENAME failed: #{result[:error]}"
+          code = { exists: "[ALREADYEXISTS] ", notfound: "[NONEXISTENT] " }[result[:code]] || ""
+          tagged tag, "NO #{code}RENAME failed: #{result[:error]}"
         else
           # The selected mailbox keeps its id across a rename; only the
           # name (used by resync) needs updating.
@@ -600,31 +628,63 @@ module MailOnRails
         end
       end
 
+      # RFC 3501 §6.3.5: renaming INBOX is special - its messages move to
+      # a newly created mailbox while INBOX itself (and any children)
+      # remain in place. Sessions with INBOX selected learn about the
+      # moved messages through their next resync.
+      def rename_inbox(tag, to)
+        if to.casecmp?("INBOX") || mailbox_names.include?(to)
+          return tagged(tag, "NO [ALREADYEXISTS] RENAME failed: mailbox exists")
+        end
+
+        create_missing_parents(to)
+        result = @store.create_mailbox(@account_id, to)
+        return tagged(tag, "NO [ALREADYEXISTS] RENAME failed: #{result[:error]}") if result[:error]
+
+        inbox = @store.select_mailbox(@account_id, "INBOX")
+        uids = inbox[:messages].map(&:first)
+        @store.move(inbox[:mailbox_id], uids, to) if uids.any?
+        tagged tag, "OK RENAME completed"
+      end
+
       def status(tag, args)
         name = Imap::Utf7.decode(args.shift.to_s)
+        # The attribute list is mandatory and non-empty per the grammar,
+        # and unknown attributes are BAD, not silently skipped.
+        return tagged(tag, "BAD STATUS expects a mailbox and attribute list") if name.empty? || args.first != :lparen
+
         items = args.select { |a| a.is_a?(String) }.map(&:upcase)
+        return tagged(tag, "BAD STATUS expects at least one attribute") if items.empty?
+
+        values = {
+          "MESSAGES" => nil, "RECENT" => 0, "UNSEEN" => nil,
+          "UIDNEXT" => nil, "UIDVALIDITY" => nil, "HIGHESTMODSEQ" => nil
+        }
+        if (unknown = items.find { |i| !values.key?(i) })
+          return tagged(tag, "BAD Unknown STATUS attribute #{unknown}")
+        end
+
         # STATUS (HIGHESTMODSEQ) is a CONDSTORE enabling command (RFC 7162 §3.1).
         @condstore = true if items.include?("HIGHESTMODSEQ")
         result = @store.status(@account_id, name)
-        return tagged(tag, "NO STATUS failed: no such mailbox") if result[:error]
+        return tagged(tag, "NO [NONEXISTENT] STATUS failed: no such mailbox") if result[:error]
 
-        values = {
+        values.merge!(
           "MESSAGES" => result[:messages],
-          "RECENT" => 0,
           "UNSEEN" => result[:unseen],
           "UIDNEXT" => result[:uid_next],
           "UIDVALIDITY" => result[:uid_validity],
           "HIGHESTMODSEQ" => result[:highest_modseq] || 1
-        }
-        # HIGHESTMODSEQ is returned only when asked for (RFC 7162).
-        items = %w[MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY] if items.empty?
-        pairs = items.filter_map { |i| "#{i} #{values[i]}" if values.key?(i) }
+        )
+        pairs = items.map { |i| "#{i} #{values[i]}" }
         untagged "STATUS #{Mime.quote(Imap::Utf7.encode(name))} (#{pairs.join(" ")})"
         tagged tag, "OK STATUS completed"
       end
 
       def select(tag, args, read_only:)
         name = Imap::Utf7.decode(args.first.to_s)
+        return tagged(tag, "BAD #{read_only ? "EXAMINE" : "SELECT"} expects a mailbox name") if name.empty?
+
         @condstore = true if args.any? { |a| a.is_a?(String) && a.casecmp?("CONDSTORE") }
         qresync = parse_qresync_param(args)
         return tagged(tag, "BAD #{qresync}") if qresync.is_a?(String)
@@ -756,15 +816,16 @@ module MailOnRails
         @modseqs = {}
       end
 
-      # Plain EXPUNGE removes every \Deleted message; UID EXPUNGE (UIDPLUS,
-      # uid_args non-nil) removes only \Deleted messages within the given set.
-      def expunge(tag, uid_args = nil)
+      # Plain EXPUNGE removes every \Deleted message; UID EXPUNGE (UIDPLUS)
+      # removes only \Deleted messages within the given set.
+      def expunge(tag, args, uid_mode)
+        return tagged(tag, "BAD EXPUNGE takes no arguments") if !uid_mode && args.any?
         return tagged(tag, "NO Mailbox is read-only") if @read_only
 
         uids = nil
-        if uid_args
-          set = uid_args.first
-          return tagged(tag, "BAD UID EXPUNGE expects a sequence set") unless set.is_a?(String)
+        if uid_mode
+          set = args.first
+          return tagged(tag, "BAD UID EXPUNGE expects a sequence set") unless set.is_a?(String) && args.length == 1
 
           uids = resolve_set(set, true).map(&:last)
           return tagged(tag, "OK EXPUNGE completed") if uids.empty?
@@ -1029,6 +1090,16 @@ module MailOnRails
         "\\deleted" => "\\Deleted", "\\draft" => "\\Draft"
       }.freeze
 
+      # Canonicalizes system-flag spellings and dedupes case-insensitively
+      # (flags are atoms). Returns nil if the list names a "\" flag the
+      # server doesn't define - clients cannot invent system flags.
+      def parse_flag_list(raw)
+        flags = raw.map { |f| CANONICAL_FLAGS.fetch(f.downcase, f) }
+        return nil if flags.any? { |f| f.start_with?("\\") && !CANONICAL_FLAGS.value?(f) }
+
+        flags.uniq(&:downcase)
+      end
+
       def store(tag, args, uid_mode)
         set = args.shift
         unchangedsince = nil
@@ -1049,9 +1120,14 @@ module MailOnRails
 
         mode = m[1].empty? ? "=" : m[1]
         silent = !m[2].nil?
-        flags = args.select { |a| a.is_a?(String) }
-                    .map { |f| CANONICAL_FLAGS.fetch(f.downcase, f) }
-                    .reject { |f| f == "\\Recent" }
+        # Grammar: a flag list "()" (possibly empty) or one-or-more bare
+        # flag atoms - no flag argument at all is BAD.
+        return tagged(tag, "BAD STORE expects a flag list") if args.none? { |a| a == :lparen || a.is_a?(String) }
+
+        flags = parse_flag_list(args.select { |a| a.is_a?(String) })
+        return tagged(tag, "BAD Unknown system flag") if flags.nil?
+
+        flags = flags.reject { |f| f == "\\Recent" }
 
         wanted = resolve_set(set, uid_mode)
         failed = []
@@ -1407,19 +1483,23 @@ module MailOnRails
         date_epoch = nil
         if (open_idx = args.index(:lparen))
           close_idx = args.index(:rparen) || args.length
-          flags = args[(open_idx + 1)...close_idx]
-                  .select { |a| a.is_a?(String) }
-                  .map { |f| CANONICAL_FLAGS.fetch(f.downcase, f) }
-                  .reject { |f| f == "\\Recent" }
+          flags = parse_flag_list(args[(open_idx + 1)...close_idx].select { |a| a.is_a?(String) })
+          return tagged(tag, "BAD Unknown system flag") if flags.nil?
+
+          flags = flags.reject { |f| f == "\\Recent" }
           args = args[(close_idx + 1)..] || []
         end
-        if (date_str = args.find { |a| a.is_a?(String) && a.match?(/\A\s*\d{1,2}-\w{3}-\d{4} /) })
-          begin
-            date_epoch = Time.strptime(date_str.strip, "%d-%b-%Y %H:%M:%S %z").to_i
+        # The only argument allowed between the flag list and the message
+        # literal is one INTERNALDATE string; anything else (junk, extra
+        # literals from an unadvertised MULTIAPPEND) is BAD.
+        if (date_str = args.shift)
+          date_epoch = begin
+            Time.strptime(date_str.to_s.strip, "%d-%b-%Y %H:%M:%S %z").to_i
           rescue ArgumentError
-            date_epoch = nil
+            return tagged(tag, "BAD Invalid APPEND date-time")
           end
         end
+        return tagged(tag, "BAD Unexpected extra APPEND arguments") if args.any?
 
         result = @store.append(@account_id, name, message, flags, date_epoch)
         if result[:error]
