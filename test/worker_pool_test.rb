@@ -151,6 +151,47 @@ class WorkerPoolTest < Minitest::Test
     end
   end
 
+  # Regression: IDLE's readiness wait must park only its own fiber. The
+  # old IO.select-based wait blocked the whole worker thread for the poll
+  # interval, starving every other session and all new connections while
+  # any client idled (surfacing as login timeouts on real devices).
+  def test_idle_session_does_not_starve_other_sessions
+    with_idle_poll(8) do
+      spec = start_server(memory_store, [ :implicit ], tls_material: tls_material, workers: 1).first
+
+      idler = tls_connect(connect(spec))
+
+      assert_match(/\A\* OK /, idler.gets("\r\n"))
+      assert_match(/\Ai1 OK/, command(idler, "i1", "LOGIN #{EMAIL} #{PASSWORD}"))
+      command(idler, "i2", "SELECT INBOX")
+      idler.write("i3 IDLE\r\n")
+
+      assert_equal "+ idling\r\n", idler.gets("\r\n")
+
+      # Well inside the idler's 8s poll window, a new connection must be
+      # greeted and served (client.timeout of 5s fails this otherwise).
+      second = tls_connect(connect(spec))
+
+      assert_match(/\A\* OK /, second.gets("\r\n"))
+      assert_match(/\An1 OK/, command(second, "n1", "NOOP"))
+
+      idler.write("DONE\r\n")
+
+      assert_match(/\Ai3 OK/, read_until_tagged(idler, "i3"))
+    end
+  end
+
+  def with_idle_poll(seconds)
+    klass = MailOnRails::ImapServer
+    old = klass.const_get(:IDLE_POLL_SECONDS)
+    klass.send(:remove_const, :IDLE_POLL_SECONDS)
+    klass.const_set(:IDLE_POLL_SECONDS, seconds)
+    yield
+  ensure
+    klass.send(:remove_const, :IDLE_POLL_SECONDS)
+    klass.const_set(:IDLE_POLL_SECONDS, old)
+  end
+
   def test_thread_mode_connection_cap_and_release
     spec = start_server(memory_store, [ :starttls ], server_class: TinyServer).first
 

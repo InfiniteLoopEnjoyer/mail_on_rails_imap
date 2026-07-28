@@ -1664,10 +1664,16 @@ module MailOnRails
 
       # True when input is waiting, false on timeout. TLS can hold
       # decrypted bytes buffered past the raw fd, so check there first.
+      #
+      # IO#wait_readable, never IO.select: sessions are fibers multiplexed
+      # on one worker thread, and the fiber scheduler hooks single-fd
+      # waits (io_wait) but not IO.select - a select here parks the whole
+      # worker for the timeout, freezing every other session and all new
+      # connections while a client sits in IDLE.
       def wait_readable(seconds)
         return true if @socket.respond_to?(:pending) && @socket.pending.positive?
 
-        !IO.select([ io_for(@socket) ], nil, nil, seconds).nil?
+        !io_for(@socket).wait_readable(seconds).nil?
       end
 
       # Refreshes the mailbox snapshot (on NOOP/CHECK and from the IDLE
