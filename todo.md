@@ -13,7 +13,8 @@ Running list of improvements. The original gap list (vs RIMS + net-imap,
       outlive MAX_AUTH_ATTEMPTS accounting for *failed* attempts (only cache
       successes).
 
-- [ ] **Plain-HTTP internal API** — drop TLS on the daemon→app hop (verified
+- [x] **Plain-HTTP internal API** — DONE 2026-07-28 (app 000d99a alias, imap
+      env flip, exim followed the same day) — drop TLS on the daemon→app hop (verified
       2026-07-28: `assume_ssl = true` means a direct `http://<container>:80`
       call reaches the internal controller, 401 not 301, so no app code
       change). Needs a stable `--network-alias` on the app's kamal role +
