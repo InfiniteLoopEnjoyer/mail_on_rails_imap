@@ -25,7 +25,7 @@ module MailOnRails
   # encrypted (LOGINDISABLED advertised in the clear).
   class ImapServer < Imap::Server
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE"
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE SEARCHRES"
     FLAGS = "\\Answered \\Flagged \\Deleted \\Seen \\Draft"
     MAX_LITERAL_BYTES = 30 * 1024 * 1024
     # How often an idling session re-checks the store for changes. The
@@ -118,6 +118,9 @@ module MailOnRails
         @qresync = false
         @read_only = false
         @logout = false
+        # SEARCHRES (RFC 5182): UIDs saved by SEARCH RETURN (SAVE),
+        # referenced as "$" in later sequence sets and search keys.
+        @saved_search = []
       end
 
       # Capabilities depend on connection state: advertise STARTTLS and
@@ -749,6 +752,8 @@ module MailOnRails
 
         @selected = { mailbox_id: result[:mailbox_id], name: result[:name] }
         @read_only = read_only
+        # RFC 5182: a successful SELECT/EXAMINE resets the search result.
+        @saved_search = []
         take_snapshot(result)
 
         untagged "FLAGS (#{FLAGS})"
@@ -925,6 +930,12 @@ module MailOnRails
       def resolve_set(set, uid_mode)
         return [] if @uids.empty?
 
+        # "$" is the whole sequence set (RFC 5182); expunged messages
+        # drop out naturally because only current uids resolve.
+        if set == "$"
+          return @uids.each_with_index.filter_map { |uid, idx| [ idx + 1, uid ] if @saved_search.include?(uid) }
+        end
+
         ranges = parse_ranges(set, uid_mode ? @uids.last : @uids.length)
         result = []
         @uids.each_with_index do |uid, idx|
@@ -979,7 +990,7 @@ module MailOnRails
       # the number of messages in the mailbox gets a tagged BAD. Chunks
       # containing "*" clamp to the mailbox instead of failing.
       def bad_seq?(set, uid_mode)
-        return false if uid_mode
+        return false if uid_mode || set.to_s == "$"
 
         set.to_s.split(",").any? do |chunk|
           next false if chunk.include?("*")
@@ -1270,7 +1281,7 @@ module MailOnRails
         def raw? = raw
       end
 
-      ESEARCH_OPTIONS = %w[MIN MAX COUNT ALL].freeze
+      ESEARCH_OPTIONS = %w[MIN MAX COUNT ALL SAVE].freeze
 
       def search(tag, args, uid_mode)
         criteria = args.dup
@@ -1304,12 +1315,17 @@ module MailOnRails
             msg && raw_keys.all? { |k| k.call(seq, msg) }
           end
         end
+        save_search_result(hits, return_opts) if return_opts&.include?("SAVE")
+
         ids = hits.map { |seq, uid| uid_mode ? uid : seq }
         # RFC 7162: a MODSEQ search key adds "(MODSEQ n)" / "MODSEQ n"
         # (highest modseq among the matches) to the response.
         modseq_max = @search_modseq && hits.any? ? hits.map { |_seq, uid| @modseqs[uid] || 1 }.max : nil
         if return_opts
-          response = esearch_response(tag, ids, return_opts, uid_mode)
+          display_opts = return_opts - [ "SAVE" ]
+          return tagged(tag, "OK SEARCH completed") if display_opts.empty?
+
+          response = esearch_response(tag, ids, display_opts, uid_mode)
           response << " MODSEQ #{modseq_max}" if modseq_max
           untagged response
         else
@@ -1320,6 +1336,19 @@ module MailOnRails
         tagged tag, "OK SEARCH completed"
       rescue SearchSyntaxError => e
         tagged tag, "BAD #{e.message}"
+      end
+
+      # RFC 5182: SAVE stores the matched UIDs as the "$" variable. When
+      # combined with only MIN and/or MAX, just those messages are saved;
+      # any other combination (or SAVE alone) saves the full result.
+      def save_search_result(hits, opts)
+        uids = hits.map(&:last) # ascending: mailbox order
+        @saved_search =
+          if (opts - %w[SAVE MIN MAX]).empty? && opts.intersect?(%w[MIN MAX])
+            [ (uids.min if opts.include?("MIN")), (uids.max if opts.include?("MAX")) ].compact.uniq
+          else
+            uids
+          end
       end
 
       # RFC 4731 "SEARCH RETURN (...)"; nil when absent (classic SEARCH).
@@ -1441,6 +1470,9 @@ module MailOnRails
           @condstore = true
           @search_modseq = true
           meta_key { |_seq, msg| (@modseqs[msg[:uid]] || 1) >= value }
+        when "$"
+          # SEARCHRES: the saved search result as a search key.
+          meta_key { |_seq, msg| @saved_search.include?(msg[:uid]) }
         when /\A[\d*][\d,:*]*\z/
           pairs = resolve_set(tok, false)
           seqs = pairs.map(&:first)
