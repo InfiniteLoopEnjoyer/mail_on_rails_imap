@@ -602,6 +602,8 @@ module MailOnRails
       def status(tag, args)
         name = Imap::Utf7.decode(args.shift.to_s)
         items = args.select { |a| a.is_a?(String) }.map(&:upcase)
+        # STATUS (HIGHESTMODSEQ) is a CONDSTORE enabling command (RFC 7162 §3.1).
+        @condstore = true if items.include?("HIGHESTMODSEQ")
         result = @store.status(@account_id, name)
         return tagged(tag, "NO STATUS failed: no such mailbox") if result[:error]
 
@@ -624,6 +626,7 @@ module MailOnRails
         name = Imap::Utf7.decode(args.first.to_s)
         @condstore = true if args.any? { |a| a.is_a?(String) && a.casecmp?("CONDSTORE") }
         qresync = parse_qresync_param(args)
+        return tagged(tag, "BAD #{qresync}") if qresync.is_a?(String)
         return tagged(tag, "BAD QRESYNC parameter requires ENABLE QRESYNC") if qresync && !@qresync
 
         was_selected = !@selected.nil?
@@ -656,17 +659,52 @@ module MailOnRails
       end
 
       # Extracts "QRESYNC (uidvalidity modseq [known-uids [(seq-match)]])"
-      # from the SELECT parameter list; returns nil when absent.
+      # from the SELECT parameter list. Returns nil when absent, a params
+      # hash when valid, or a String error message (for a BAD reply) when
+      # malformed per the RFC 7162 grammar: both leading numbers nonzero,
+      # no "*" anywhere, seq-match-data two equal-length sets.
       def parse_qresync_param(args)
         idx = args.index { |a| a.is_a?(String) && a.casecmp?("QRESYNC") }
-        return nil unless idx && args[idx + 1] == :lparen
+        return nil unless idx
+        return "Duplicate QRESYNC parameter" if args[(idx + 1)..].any? { |a| a.is_a?(String) && a.casecmp?("QRESYNC") }
+        return "QRESYNC expects (uidvalidity modseq [known-uids [seq-match-data]])" unless args[idx + 1] == :lparen
 
-        values = args[(idx + 2)..].take_while { |a| a != :rparen && a != :lparen }
-        {
-          uid_validity: values[0].to_i,
-          modseq: values[1].to_i,
-          known_uids: values[2] # optional uid-set string or nil
-        }
+        rest = args[(idx + 2)..]
+        values = rest.take_while { |a| a != :rparen && a != :lparen }
+        unless values[0].to_s.match?(/\A[1-9]\d*\z/) && values[1].to_s.match?(/\A[1-9]\d*\z/)
+          return "QRESYNC uidvalidity and modseq must be nonzero numbers"
+        end
+        return "QRESYNC takes at most four arguments" if values.length > 3
+
+        known = values[2]
+        if known && !known.match?(/\A\d[\d,:]*\z/)
+          return "QRESYNC known-uids must be a uid-set without *"
+        end
+
+        if (error = validate_seq_match_data(rest))
+          return error
+        end
+
+        { uid_validity: values[0].to_i, modseq: values[1].to_i, known_uids: known }
+      end
+
+      # Syntax-checks the optional seq-match-data "(known-seqs known-uids)".
+      # Its semantics are an optimization the server is free to ignore
+      # (RFC 7162 §3.2.5.2), but malformed data must still be rejected.
+      def validate_seq_match_data(rest)
+        inner_at = rest.index(:lparen)
+        return nil unless inner_at && inner_at < rest.index(:rparen).to_i
+
+        inner = rest[(inner_at + 1)..].take_while { |a| a != :rparen }
+        return "QRESYNC seq-match-data expects two sequence sets" unless inner.length == 2
+        unless inner.all? { |s| s.is_a?(String) && s.match?(/\A\d[\d,:]*\z/) }
+          return "QRESYNC seq-match-data sets cannot contain *"
+        end
+
+        sizes = inner.map { |s| parse_ranges(s, 0).sum(&:size) }
+        return "QRESYNC seq-match-data sets must be the same length" unless sizes.first == sizes.last
+
+        nil
       end
 
       # The QRESYNC fast-resync: VANISHED (EARLIER) for expunges the
@@ -734,7 +772,15 @@ module MailOnRails
         result = @store.expunge(@selected[:mailbox_id], uids)
         removed = result[:uids] || []
         report_removed(removed)
-        tagged tag, "OK EXPUNGE completed"
+        @highest_modseq = result[:highest_modseq] if result[:highest_modseq]
+        # RFC 7162 §3.2.7/§3.2.9: when something was expunged, the tagged
+        # OK carries the updated HIGHESTMODSEQ (a MUST once QRESYNC is
+        # enabled, optional but recommended for plain CONDSTORE).
+        if @condstore && removed.any?
+          tagged tag, "OK [HIGHESTMODSEQ #{@highest_modseq}] EXPUNGE completed"
+        else
+          tagged tag, "OK EXPUNGE completed"
+        end
       end
 
       # Announces removals as either per-sequence EXPUNGE lines (highest
@@ -831,16 +877,18 @@ module MailOnRails
 
       # Pulls the RFC 7162 "(CHANGEDSINCE n [VANISHED])" modifier group
       # out of the argument list (it follows the item list); returns
-      # [n, vanished?] or [nil, false].
+      # [n, vanished?] or [nil, false]. A VANISHED without CHANGEDSINCE
+      # still extracts (as [nil, true]) so fetch can reject it with BAD.
       def extract_fetch_modifiers(args)
-        idx = args.index { |a| a.is_a?(String) && a.casecmp?("CHANGEDSINCE") }
+        idx = args.index { |a| a.is_a?(String) && (a.casecmp?("CHANGEDSINCE") || a.casecmp?("VANISHED")) }
         return [ nil, false ] unless idx
 
-        value = args[idx + 1].to_i
         first = args[0..idx].rindex(:lparen) || idx
         last = args[(idx + 1)..].index(:rparen)
         last = last ? idx + 1 + last : idx + 1
         group = args.slice!(first..last)
+        cs = group.index { |a| a.is_a?(String) && a.casecmp?("CHANGEDSINCE") }
+        value = cs && group[cs + 1].is_a?(String) ? group[cs + 1].to_i : nil
         [ value, group.any? { |a| a.is_a?(String) && a.casecmp?("VANISHED") } ]
       end
 
@@ -1379,7 +1427,13 @@ module MailOnRails
         @uids.each_with_index do |uid, idx|
           next unless old_flags.key?(uid) && old_flags[uid].sort != @flags[uid].sort
 
-          untagged "#{idx + 1} FETCH (FLAGS (#{@flags[uid].join(" ")}))"
+          # RFC 7162: CONDSTORE-aware sessions get MODSEQ in every
+          # unsolicited FETCH; QRESYNC sessions additionally get the UID.
+          parts = []
+          parts << "UID #{uid}" if @qresync
+          parts << "FLAGS (#{@flags[uid].join(" ")})"
+          parts << "MODSEQ (#{@modseqs[uid] || 1})" if @condstore
+          untagged "#{idx + 1} FETCH (#{parts.join(" ")})"
         end
       end
     end

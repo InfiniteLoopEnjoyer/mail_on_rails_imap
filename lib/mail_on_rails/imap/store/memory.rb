@@ -179,13 +179,18 @@ module MailOnRails
             mailbox = mailbox_by_id(mailbox_id)
             messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
             updated = messages.map do |m|
-              m[:flags] =
+              new_flags =
                 case mode
                 when "+" then (m[:flags] | flags)
                 when "-" then (m[:flags] - flags)
                 else flags.dup
                 end
-              m[:modseq] = next_modseq(mailbox)
+              # A store that changes nothing gets no new modseq: clients
+              # would otherwise re-sync messages whose state is identical.
+              if new_flags.sort != m[:flags].sort
+                m[:flags] = new_flags
+                m[:modseq] = next_modseq(mailbox)
+              end
               [ m[:uid], m[:flags].dup, m[:modseq] ]
             end
             { messages: updated }
@@ -205,7 +210,7 @@ module MailOnRails
             mailbox[:messages] = kept
             removed = doomed.map { |m| m[:uid] }.sort
             add_tombstones(mailbox, removed)
-            { uids: removed }
+            { uids: removed, highest_modseq: mailbox[:highest_modseq] }
           end
         end
 
