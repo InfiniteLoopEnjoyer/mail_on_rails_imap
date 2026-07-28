@@ -31,7 +31,7 @@ module MailOnRails
     # mailbox - the same cap the literal reader enforces.
     # Interpolation defeats the frozen_string_literal magic comment; the
     # explicit freeze keeps this Ractor-shareable for worker Ractors.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE SEARCHRES OBJECTID SAVEDATE PREVIEW APPENDLIMIT=#{MAX_LITERAL_BYTES}".freeze
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE SEARCHRES OBJECTID SAVEDATE PREVIEW REPLACE SORT APPENDLIMIT=#{MAX_LITERAL_BYTES}".freeze
     # How often an idling session re-checks the store for changes. The
     # store is the source of truth and other writers (delivery through the
     # Rails app, other sessions, possibly other daemon processes) don't
@@ -304,6 +304,7 @@ module MailOnRails
         when "SELECT"       then require_auth(tag) { select(tag, args, read_only: false) }
         when "EXAMINE"      then require_auth(tag) { select(tag, args, read_only: true) }
         when "APPEND"       then require_auth(tag) { append(tag, args) }
+        when "REPLACE"      then require_selected(tag) { replace(tag, args, uid_mode) }
         when "CLOSE"        then require_selected(tag) { close(tag) }
         when "UNSELECT"     then require_selected(tag) { unselect(tag) }
         when "EXPUNGE"      then require_selected(tag) { expunge(tag, args, uid_mode) }
@@ -312,6 +313,7 @@ module MailOnRails
         when "COPY"         then require_selected(tag) { copy(tag, args, uid_mode) }
         when "MOVE"         then require_selected(tag) { move(tag, args, uid_mode) }
         when "SEARCH"       then require_selected(tag) { search(tag, args, uid_mode) }
+        when "SORT"         then require_selected(tag) { sort(tag, args, uid_mode) }
         when "IDLE"         then require_auth(tag) { idle(tag) }
         else tagged tag, "BAD Unknown command #{name}"
         end
@@ -1330,27 +1332,7 @@ module MailOnRails
           end
         end
 
-        matchers = []
-        matchers << parse_search_key(criteria, uid_mode) until criteria.empty?
-        matchers.compact!
-        meta_keys, raw_keys = matchers.partition { |k| !k.raw? }
-
-        # Two-phase evaluation: metadata keys (flags, dates, sizes, sets)
-        # run against the cheap metadata fetch; message bytes are pulled
-        # only for the survivors that content keys still need to inspect.
-        all = @uids.each_with_index.map { |uid, idx| [ idx + 1, uid ] }
-        messages = fetch_messages(@uids, false)
-        hits = all.select do |seq, uid|
-          msg = messages[uid]
-          msg && meta_keys.all? { |k| k.call(seq, msg) }
-        end
-        if raw_keys.any? && hits.any?
-          raw_messages = fetch_messages(hits.map(&:last), true)
-          hits = hits.select do |seq, uid|
-            msg = raw_messages[uid]
-            msg && raw_keys.all? { |k| k.call(seq, msg) }
-          end
-        end
+        hits = search_hits(criteria, uid_mode)
         save_search_result(hits, return_opts) if return_opts&.include?("SAVE")
 
         ids = hits.map { |seq, uid| uid_mode ? uid : seq }
@@ -1372,6 +1354,145 @@ module MailOnRails
         tagged tag, "OK SEARCH completed"
       rescue SearchSyntaxError => e
         tagged tag, "BAD #{e.message}"
+      end
+
+      SORT_KEYS = %w[ARRIVAL CC DATE FROM SIZE SUBJECT TO].freeze
+      RAW_SORT_KEYS = %w[CC DATE FROM SUBJECT TO].freeze
+
+      # RFC 5256 SORT: "(criteria) charset search-keys". Matches like
+      # SEARCH, then orders by the criteria in turn (REVERSE flips the
+      # single following criterion), final tiebreak ascending sequence.
+      def sort(tag, args, uid_mode)
+        criteria = parse_sort_criteria(args)
+        return tagged(tag, "BAD #{criteria}") if criteria.is_a?(String)
+
+        charset = args.shift
+        unless charset.is_a?(String) && SEARCH_CHARSETS.any? { |c| charset.casecmp?(c) }
+          return tagged(tag, "NO [BADCHARSET (#{SEARCH_CHARSETS.join(" ")})] Charset not supported")
+        end
+        return tagged(tag, "BAD SORT expects search criteria") if args.empty?
+
+        @search_modseq = false
+        hits = search_hits(args, uid_mode)
+        need_raw = criteria.any? { |key, _rev| RAW_SORT_KEYS.include?(key) }
+        messages = fetch_messages(hits.map(&:last), need_raw)
+
+        keyed = hits.map { |seq, uid| [ seq, uid, sort_values(messages[uid], criteria) ] }
+        sorted = keyed.sort do |a, b|
+          order = 0
+          criteria.each_with_index do |(_key, reverse), i|
+            order = a[2][i] <=> b[2][i]
+            order = -order if reverse
+            break unless order.zero?
+          end
+          order.zero? ? a[0] <=> b[0] : order
+        end
+
+        ids = sorted.map { |seq, uid, _values| uid_mode ? uid : seq }
+        untagged +"SORT #{ids.join(" ")}".rstrip
+        tagged tag, "OK SORT completed"
+      rescue SearchSyntaxError => e
+        tagged tag, "BAD #{e.message}"
+      end
+
+      # Returns [[KEY, reverse?], ...] or an error String.
+      def parse_sort_criteria(args)
+        return "SORT expects a criteria list" unless args.shift == :lparen
+
+        criteria = []
+        reverse = false
+        loop do
+          token = args.shift
+          return "SORT expects a criteria list" if token.nil?
+          break if token == :rparen
+
+          name = token.to_s.upcase
+          if name == "REVERSE"
+            reverse = true
+          elsif SORT_KEYS.include?(name)
+            criteria << [ name, reverse ]
+            reverse = false
+          else
+            return "Unknown SORT criterion #{name}"
+          end
+        end
+        return "SORT expects at least one criterion" if criteria.empty?
+        return "REVERSE expects a following criterion" if reverse
+
+        criteria
+      end
+
+      # One comparable value per criterion. Address criteria use the
+      # addr-mailbox (localpart) of the first address; DATE falls back to
+      # INTERNALDATE when the Date header is missing or unparseable.
+      def sort_values(msg, criteria)
+        headers = nil
+        read_header = lambda do |name|
+          headers ||= Mime.parse_headers(Mime.split_header(msg[:raw].to_s)[0])
+          headers[name]&.first.to_s
+        end
+
+        criteria.map do |key, _reverse|
+          case key
+          when "ARRIVAL" then msg[:internal_date]
+          when "SIZE"    then msg[:size]
+          when "DATE"
+            begin
+              Time.parse(read_header.call("date")).to_i
+            rescue ArgumentError, TypeError
+              msg[:internal_date]
+            end
+          when "FROM" then first_addr_mailbox(read_header.call("from"))
+          when "TO"   then first_addr_mailbox(read_header.call("to"))
+          when "CC"   then first_addr_mailbox(read_header.call("cc"))
+          when "SUBJECT" then base_subject(read_header.call("subject"))
+          end
+        end
+      end
+
+      def first_addr_mailbox(value)
+        Mime.parse_addresses(value).first&.at(1).to_s.downcase
+      end
+
+      # RFC 5256 §2.1 base subject, simplified: strip trailing "(fwd)"
+      # and leading re:/fw:/fwd: markers (with optional [blah]) until
+      # stable. Case-insensitive by downcasing.
+      def base_subject(subject)
+        s = subject.to_s.gsub(/\s+/, " ").strip.downcase
+        loop do
+          before = s
+          s = s.sub(/\s*\(fwd\)\s*\z/, "")
+          s = s.sub(/\A\s*(?:re|fwd?)\s*(?:\[[^\]]*\])?\s*:\s*/, "")
+          break if s == before
+        end
+        s
+      end
+
+      # Evaluates search-key tokens against the current snapshot and
+      # returns matching [seq, uid] pairs in mailbox order. Two-phase:
+      # metadata keys (flags, dates, sizes, sets) run against the cheap
+      # metadata fetch; message bytes are pulled only for survivors that
+      # content keys still need. Raises SearchSyntaxError on bad keys.
+      def search_hits(criteria, uid_mode)
+        matchers = []
+        matchers << parse_search_key(criteria, uid_mode) until criteria.empty?
+        matchers.compact!
+        meta_keys, raw_keys = matchers.partition { |k| !k.raw? }
+
+        all = @uids.each_with_index.map { |uid, idx| [ idx + 1, uid ] }
+        messages = fetch_messages(@uids, false)
+        hits = all.select do |seq, uid|
+          msg = messages[uid]
+          msg && meta_keys.all? { |k| k.call(seq, msg) }
+        end
+        if raw_keys.any? && hits.any?
+          raw_messages = fetch_messages(hits.map(&:last), true)
+          hits = hits.select do |seq, uid|
+            msg = raw_messages[uid]
+            msg && raw_keys.all? { |k| k.call(seq, msg) }
+          end
+        end
+        hits
       end
 
       # RFC 5182: SAVE stores the matched UIDs as the "$" variable. When
@@ -1610,27 +1731,8 @@ module MailOnRails
         message = args.pop
         return tagged(tag, "BAD APPEND expects a mailbox and message") if name.empty? || !message.is_a?(String)
 
-        flags = []
-        date_epoch = nil
-        if (open_idx = args.index(:lparen))
-          close_idx = args.index(:rparen) || args.length
-          flags = parse_flag_list(args[(open_idx + 1)...close_idx].select { |a| a.is_a?(String) })
-          return tagged(tag, "BAD Unknown system flag") if flags.nil?
-
-          flags = flags.reject { |f| f == "\\Recent" }
-          args = args[(close_idx + 1)..] || []
-        end
-        # The only argument allowed between the flag list and the message
-        # literal is one INTERNALDATE string; anything else (junk, extra
-        # literals from an unadvertised MULTIAPPEND) is BAD.
-        if (date_str = args.shift)
-          date_epoch = begin
-            Time.strptime(date_str.to_s.strip, "%d-%b-%Y %H:%M:%S %z").to_i
-          rescue ArgumentError
-            return tagged(tag, "BAD Invalid APPEND date-time")
-          end
-        end
-        return tagged(tag, "BAD Unexpected extra APPEND arguments") if args.any?
+        flags, date_epoch = parse_append_args(args)
+        return tagged(tag, "BAD #{flags}") if flags.is_a?(String)
 
         result = @store.append(@account_id, name, message, flags, date_epoch)
         if result[:error]
@@ -1642,6 +1744,73 @@ module MailOnRails
           resync if @selected && @selected[:name].casecmp?(name)
           tagged tag, "OK [APPENDUID #{result[:uid_validity]} #{result[:uid]}] APPEND completed"
         end
+      end
+
+      # Parses APPEND's optional "(flags)" and date-time arguments (shared
+      # with REPLACE). Returns [flags, date_epoch] or an error String -
+      # junk or extra literals (unadvertised MULTIAPPEND) are errors.
+      def parse_append_args(args)
+        flags = []
+        date_epoch = nil
+        if (open_idx = args.index(:lparen))
+          close_idx = args.index(:rparen) || args.length
+          flags = parse_flag_list(args[(open_idx + 1)...close_idx].select { |a| a.is_a?(String) })
+          return "Unknown system flag" if flags.nil?
+
+          flags = flags.reject { |f| f == "\\Recent" }
+          args = args[(close_idx + 1)..] || []
+        end
+        if (date_str = args.shift)
+          date_epoch = begin
+            Time.strptime(date_str.to_s.strip, "%d-%b-%Y %H:%M:%S %z").to_i
+          rescue ArgumentError
+            return "Invalid APPEND date-time"
+          end
+        end
+        return "Unexpected extra APPEND arguments" if args.any?
+
+        [ flags, date_epoch ]
+      end
+
+      # RFC 8508 REPLACE: append the new message to the named mailbox and
+      # remove the identified one from the selected mailbox, presented to
+      # the client as one action (append first - the original MUST
+      # survive a failed append).
+      def replace(tag, args, uid_mode)
+        return tagged(tag, "NO Mailbox is read-only") if @read_only
+
+        id = args.shift
+        return tagged(tag, "BAD REPLACE expects a single message id") unless id.is_a?(String) && id.match?(/\A\d+\z/)
+        return tagged(tag, "BAD Message sequence number out of range") if bad_seq?(id, uid_mode)
+
+        target = resolve_set(id, uid_mode)
+        return tagged(tag, "NO No such message") unless target.length == 1
+
+        name = Imap::Utf7.decode(args.shift.to_s)
+        message = args.pop
+        return tagged(tag, "BAD REPLACE expects a mailbox and message") if name.empty? || !message.is_a?(String)
+
+        flags, date_epoch = parse_append_args(args)
+        return tagged(tag, "BAD #{flags}") if flags.is_a?(String)
+
+        result = @store.append(@account_id, name, message, flags, date_epoch)
+        if result[:error]
+          code = result[:code] == :notfound ? "[TRYCREATE] " : ""
+          return tagged(tag, "NO #{code}REPLACE failed: #{result[:error]}")
+        end
+
+        untagged "OK [APPENDUID #{result[:uid_validity]} #{result[:uid]}] Replacement ready"
+
+        uid = target.first.last
+        @store.store_flags(@selected[:mailbox_id], [ uid ], "+", [ "\\Deleted" ])
+        expunged = @store.expunge(@selected[:mailbox_id], [ uid ])
+        @highest_modseq = expunged[:highest_modseq] if expunged[:highest_modseq]
+        if @selected[:name].casecmp?(name)
+          resync # one pass reports both the EXISTS and the removal
+        else
+          report_removed(expunged[:uids] || [])
+        end
+        tagged tag, "OK REPLACE completed"
       end
 
       # -- IDLE / resync -----------------------------------------------------------
