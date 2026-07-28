@@ -77,6 +77,40 @@ class ImapSessionTest < Minitest::Test
     end
   end
 
+  # Simulates the app being unreachable: credential lookups degrade to the
+  # HTTP store's error envelope instead of a credential verdict.
+  class UnreachableStore < MailOnRails::Imap::Store::Memory
+    def authenticate(_email, _password) = { error: "Net::OpenTimeout", code: :internal }
+    def scram_credentials(_email) = { error: "Net::OpenTimeout", code: :internal }
+  end
+
+  def test_login_with_unreachable_store_is_a_temporary_failure_not_bad_credentials
+    @store = UnreachableStore.new
+    with_session do |client|
+      client.gets("\r\n")
+      reply = command(client, "a1", "LOGIN #{EMAIL} #{PASSWORD}")
+      assert_match(/\Aa1 NO \[UNAVAILABLE\]/, reply)
+      refute_match(/AUTHENTICATIONFAILED/, reply)
+
+      # Temporary failures must not count toward MAX_AUTH_ATTEMPTS: the
+      # connection survives more of them than the failed-auth cap allows.
+      (MailOnRails::ImapServer::MAX_AUTH_ATTEMPTS + 1).times do |i|
+        assert_match(/\Ar#{i} NO \[UNAVAILABLE\]/, command(client, "r#{i}", "LOGIN #{EMAIL} #{PASSWORD}"))
+      end
+      command(client, "a2", "LOGOUT")
+    end
+  end
+
+  def test_scram_with_unreachable_store_is_a_temporary_failure
+    @store = UnreachableStore.new
+    with_session do |client|
+      client.gets("\r\n")
+      initial = [ "n,,n=#{EMAIL},r=clientnonce" ].pack("m0")
+      assert_match(/\As1 NO \[UNAVAILABLE\]/, command(client, "s1", "AUTHENTICATE SCRAM-SHA-256 #{initial}"))
+      command(client, "s2", "LOGOUT")
+    end
+  end
+
   def login_and_select(client)
     client.gets("\r\n")
     command(client, "l1", "LOGIN #{EMAIL} #{PASSWORD}")

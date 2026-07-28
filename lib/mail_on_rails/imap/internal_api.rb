@@ -26,9 +26,20 @@ module MailOnRails
       OPEN_TIMEOUT = 5
       READ_TIMEOUT = 60 # fetches ship whole messages back
 
+      # Connections are kept alive and pooled: a TLS handshake per store
+      # call is what made IMAP feel slow, and handshake stalls under host
+      # memory pressure were surfacing as login failures. Net::HTTP
+      # re-validates a pooled connection itself - past keep_alive_timeout
+      # it reconnects before sending rather than risking a request on a
+      # socket the proxy already closed.
+      KEEP_ALIVE_TIMEOUT = 15
+      POOL_SIZE = 4 # retained connections; bursts open extra, shed on checkin
+
       def initialize(url: default_url, password: default_password)
         @base = URI(url.to_s.chomp("/"))
         @password = password
+        @pool = []
+        @pool_lock = Mutex.new
       end
 
       # => { account_id:, email: } (both nil on bad credentials)
@@ -82,10 +93,43 @@ module MailOnRails
       def perform(request)
         # The basic-auth username is fixed by the app's controller.
         request.basic_auth("mail_on_rails", @password.to_s)
-        Net::HTTP.start(@base.host, @base.port, use_ssl: @base.scheme == "https",
-                        open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT) do |http|
-          http.request(request)
+        http = checkout
+        begin
+          response = http.request(request)
+        rescue StandardError
+          discard(http)
+          raise
         end
+        checkin(http)
+        response
+      end
+
+      # Sessions are fibers multiplexed on one thread per worker (see
+      # Imap::Worker), so a Mutex is enough: a contested checkout parks
+      # the fiber. The lock only guards the pool array - connections are
+      # opened and used outside it, so slow requests don't serialize.
+      def checkout
+        @pool_lock.synchronize { @pool.pop } || connect
+      end
+
+      def checkin(http)
+        surplus = @pool_lock.synchronize { @pool.size < POOL_SIZE ? (@pool.push(http); nil) : http }
+        discard(surplus) if surplus
+      end
+
+      def discard(http)
+        http.finish
+      rescue StandardError
+        nil
+      end
+
+      def connect
+        http = Net::HTTP.new(@base.host, @base.port)
+        http.use_ssl = @base.scheme == "https"
+        http.open_timeout = OPEN_TIMEOUT
+        http.read_timeout = READ_TIMEOUT
+        http.keep_alive_timeout = KEEP_ALIVE_TIMEOUT
+        http.start
       end
 
       def default_url

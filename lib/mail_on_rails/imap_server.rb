@@ -402,7 +402,12 @@ module MailOnRails
         return tagged(tag, "BAD Malformed SCRAM message") if user.empty? || cnonce.empty?
 
         creds = @store.scram_credentials(user)
-        return auth_failure(tag, user) if creds[:error]
+        if creds[:error]
+          # :notfound is a real credential miss (unknown account, or one
+          # whose password predates SCRAM derivation); anything else is the
+          # store being unreachable.
+          return creds[:code] == :notfound ? auth_failure(tag, user) : store_unavailable(tag, "AUTHENTICATE")
+        end
 
         nonce = cnonce + SecureRandom.alphanumeric(24)
         server_first = "r=#{nonce},s=#{creds[:salt_base64]},i=#{creds[:iterations]}"
@@ -464,9 +469,21 @@ module MailOnRails
           @account_id = result[:account_id]
           @store.log(:info, "IMAP login #{result[:email]} (#{peer_ip})")
           tagged tag, "OK [CAPABILITY #{capabilities}] #{verb} completed"
+        elsif result[:error]
+          store_unavailable(tag, verb)
         else
           auth_failure(tag, user)
         end
+      end
+
+      # A store error during authentication means the app is unreachable,
+      # not that the credentials are wrong. Answer with a temporary failure
+      # (RFC 5530 UNAVAILABLE) so clients keep the saved password and retry
+      # quietly instead of re-prompting the user, and don't count it toward
+      # MAX_AUTH_ATTEMPTS.
+      def store_unavailable(tag, verb)
+        @store.log(:warn, "#{verb} temporary failure (#{peer_ip}): store unreachable")
+        tagged tag, "NO [UNAVAILABLE] Temporary server error, try again later"
       end
 
       def id(tag)
