@@ -71,9 +71,16 @@ Rule: every item lands with tests.
       VANISHED instead of EXPUNGE once enabled; UID FETCH (CHANGEDSINCE n
       VANISHED). Rails: expunged_messages table + mailboxes.tombstone_floor
       (migration 20260727230000), EmailMessage#record_tombstone.
-- [ ] AUTH=SCRAM-SHA-256 — server needs per-account salt/iterations/
-      StoredKey/ServerKey, derived at password-set time in the Rails app
-      (bcrypt hash alone can't do SCRAM). New store op to fetch SCRAM creds.
+- [x] AUTH=SCRAM-SHA-256 — DONE 2026-07-27: Imap::Scram crypto module
+      (pinned to RFC 7677 test vectors), scram_credentials store op
+      (verifier material only, never the password), full server exchange
+      in the session (gs2 parsing, channel binding refused, nonce/proof/
+      c= verification, server signature, MAX_AUTH_ATTEMPTS accounting).
+      Rails derives salt/iterations/StoredKey/ServerKey at password-set
+      time (migration 20260728000000, keys encrypted at rest).
+      NOTE: pre-existing accounts can't use SCRAM until their next
+      password change (bcrypt digests can't be converted); they keep
+      working via AUTH=PLAIN over TLS.
 - [x] SEARCH raw-fetch elimination — two-phase evaluation (2026-07-27):
       keys are compiled as SearchKey(raw?, fn); metadata keys (flags, dates,
       sizes, sets, OLDER/YOUNGER) filter first against a metadata-only fetch,

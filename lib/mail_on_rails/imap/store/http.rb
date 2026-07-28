@@ -45,6 +45,10 @@ module MailOnRails
           wrap { @api.authenticate(email.to_s, password.to_s) }
         end
 
+        def scram_credentials(email)
+          op(:scram_credentials, email: email)
+        end
+
         def list_mailboxes(account_id)
           op(:list_mailboxes, account_id: account_id)
         end

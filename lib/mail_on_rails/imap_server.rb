@@ -2,6 +2,8 @@
 
 require "strscan"
 require "time"
+require "securerandom"
+require "mail_on_rails/imap/scram"
 require "mail_on_rails/imap/server"
 require "mail_on_rails/imap/session_helpers"
 require "mail_on_rails/imap/utf7"
@@ -123,7 +125,7 @@ module MailOnRails
       def capabilities
         caps = BASE_CAPABILITIES.dup
         if @tls
-          caps << " AUTH=PLAIN SASL-IR"
+          caps << " AUTH=PLAIN AUTH=SCRAM-SHA-256 SASL-IR"
         else
           caps << " STARTTLS" if @tls_ctx
           caps << " LOGINDISABLED"
@@ -355,20 +357,101 @@ module MailOnRails
         return tagged(tag, "NO [PRIVACYREQUIRED] STARTTLS required before AUTHENTICATE") if tls_required?
 
         mechanism, initial = args
-        return tagged(tag, "NO Unsupported authentication mechanism") unless mechanism.to_s.casecmp?("PLAIN")
-
-        unless initial
-          @socket.write("+ \r\n")
-          line = read_line
-          return unless line
-
-          initial = line.chomp("\r\n")
-          return tagged(tag, "BAD Authentication cancelled") if initial == "*"
+        case mechanism.to_s.upcase
+        when "PLAIN" then authenticate_plain(tag, initial)
+        when "SCRAM-SHA-256" then authenticate_scram(tag, initial)
+        else tagged(tag, "NO Unsupported authentication mechanism")
         end
-        _authzid, user, pass = decode_sasl_plain(initial)
-        complete_login(tag, "AUTHENTICATE", user, pass)
       rescue ArgumentError
         tagged tag, "BAD Invalid base64"
+      end
+
+      def authenticate_plain(tag, initial)
+        initial = sasl_challenge(tag, "") { return } if initial.nil?
+        return if initial.nil?
+
+        _authzid, user, pass = decode_sasl_plain(initial)
+        complete_login(tag, "AUTHENTICATE", user, pass)
+      end
+
+      # Sends a SASL continuation and reads the client's base64 reply.
+      # Yields (to abort the command) on connection loss; returns nil after
+      # answering a "*" cancellation.
+      def sasl_challenge(tag, data)
+        @socket.write("+ #{data}\r\n")
+        line = read_line
+        yield unless line
+
+        text = line.chomp("\r\n")
+        return tagged(tag, "BAD Authentication cancelled") && nil if text == "*"
+
+        text
+      end
+
+      # Server side of SCRAM-SHA-256 (RFC 5802/7677), no channel binding.
+      # The store supplies only verifier material (StoredKey/ServerKey) -
+      # the password itself never travels on this path.
+      def authenticate_scram(tag, initial)
+        client_first = initial || (sasl_challenge(tag, "") { return } or return)
+        gs2, bare = split_scram_gs2(client_first.unpack1("m0").to_s)
+        return tagged(tag, "NO Channel binding not supported") if gs2.nil?
+
+        attrs = scram_attrs(bare)
+        user = attrs["n"].to_s.gsub("=2C", ",").gsub("=3D", "=")
+        cnonce = attrs["r"].to_s
+        return tagged(tag, "BAD Malformed SCRAM message") if user.empty? || cnonce.empty?
+
+        creds = @store.scram_credentials(user)
+        return auth_failure(tag, user) if creds[:error]
+
+        nonce = cnonce + SecureRandom.alphanumeric(24)
+        server_first = "r=#{nonce},s=#{creds[:salt_base64]},i=#{creds[:iterations]}"
+        reply = sasl_challenge(tag, [ server_first ].pack("m0")) { return } or return
+
+        client_final = reply.unpack1("m0").to_s
+        final_attrs = scram_attrs(client_final)
+        proof = final_attrs["p"].to_s.unpack1("m0").to_s
+        without_proof = client_final[/\A(.*),p=[^,]*\z/m, 1].to_s
+        auth_message = "#{bare},#{server_first},#{without_proof}"
+
+        stored_key = creds[:stored_key_base64].unpack1("m0")
+        unless final_attrs["r"] == nonce &&
+               final_attrs["c"] == [ gs2 ].pack("m0") &&
+               Imap::Scram.valid_proof?(stored_key, auth_message, proof)
+          return auth_failure(tag, user)
+        end
+
+        server_key = creds[:server_key_base64].unpack1("m0")
+        verifier = "v=#{[ Imap::Scram.server_signature(server_key, auth_message) ].pack("m0")}"
+        empty = sasl_challenge(tag, [ verifier ].pack("m0")) { return } or return
+        return tagged(tag, "BAD Unexpected final client response") unless empty.empty?
+
+        @account_id = creds[:account_id]
+        @store.log(:info, "IMAP login #{creds[:email]} (#{peer_ip}, SCRAM)")
+        tagged tag, "OK [CAPABILITY #{capabilities}] AUTHENTICATE completed"
+      end
+
+      # Splits the GS2 header ("n,," / "y,," / "n,a=authzid,") from the
+      # bare message; nil when the client demands channel binding ("p=").
+      def split_scram_gs2(message)
+        m = message.match(/\A([ny],(?:a=[^,]*)?,)(.*)\z/m)
+        m && [ m[1], m[2] ]
+      end
+
+      def scram_attrs(message)
+        message.split(",").filter_map { |part| [ part[0], part[2..] ] if part[1] == "=" }.to_h
+      end
+
+      # Shared failed-auth accounting for LOGIN/AUTHENTICATE paths that
+      # don't go through the store's password check.
+      def auth_failure(tag, user)
+        @auth_attempts += 1
+        @store.log(:warn, "IMAP auth failed for #{user.to_s.empty? ? "(empty)" : user} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
+        tagged tag, "NO [AUTHENTICATIONFAILED] Invalid credentials"
+        if @auth_attempts >= MAX_AUTH_ATTEMPTS
+          untagged "BYE Too many failed authentication attempts"
+          @logout = true
+        end
       end
 
       # Shared LOGIN/AUTHENTICATE outcome. Failed attempts are capped like
@@ -382,13 +465,7 @@ module MailOnRails
           @store.log(:info, "IMAP login #{result[:email]} (#{peer_ip})")
           tagged tag, "OK [CAPABILITY #{capabilities}] #{verb} completed"
         else
-          @auth_attempts += 1
-          @store.log(:warn, "IMAP auth failed for #{user.to_s.empty? ? "(empty)" : user} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
-          tagged tag, "NO [AUTHENTICATIONFAILED] Invalid credentials"
-          if @auth_attempts >= MAX_AUTH_ATTEMPTS
-            untagged "BYE Too many failed authentication attempts"
-            @logout = true
-          end
+          auth_failure(tag, user)
         end
       end
 

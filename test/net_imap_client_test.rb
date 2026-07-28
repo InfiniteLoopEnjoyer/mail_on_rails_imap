@@ -150,6 +150,24 @@ class NetImapClientTest < Minitest::Test
     end
   end
 
+  def test_scram_sha_256_authentication
+    with_client do |imap|
+      assert imap.capable?("AUTH=SCRAM-SHA-256")
+      imap.authenticate("SCRAM-SHA-256", EMAIL, PASSWORD)
+      imap.select("INBOX")
+      assert_equal [ 1 ], imap.search([ "ALL" ])
+    end
+  end
+
+  def test_scram_sha_256_rejects_wrong_password
+    with_client do |imap|
+      err = assert_raises(Net::IMAP::NoResponseError, Net::IMAP::SASL::Error) do
+        imap.authenticate("SCRAM-SHA-256", EMAIL, "wrong-password")
+      end
+      assert err
+    end
+  end
+
   def test_qresync_enable_and_vanished_parsing
     @store.append(@account_id, "INBOX", RAW, [], nil) # uid 2
     with_client do |imap|

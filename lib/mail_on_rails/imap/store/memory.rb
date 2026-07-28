@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "monitor"
+require_relative "../scram"
 
 module MailOnRails
   module Imap
@@ -32,7 +33,8 @@ module MailOnRails
 
         def add_account(email:, password:)
           @lock.synchronize do
-            account = { id: next_id(:account), email: normalize(email), password: password.to_s, mailboxes: {} }
+            account = { id: next_id(:account), email: normalize(email), password: password.to_s,
+                        scram: Imap::Scram.derive(password.to_s), mailboxes: {} }
             DEFAULT_MAILBOXES.each { |name| account[:mailboxes][name] = new_mailbox(name) }
             @accounts[account[:id]] = account
             account[:id]
@@ -51,6 +53,26 @@ module MailOnRails
             account = @accounts.values.find { |a| a[:email] == normalize(email) }
             account = nil unless account && !password.to_s.empty? && account[:password] == password.to_s
             { account_id: account&.dig(:id), email: account&.dig(:email) }
+          end
+        end
+
+        # SCRAM-SHA-256 verifier material for AUTHENTICATE (never the
+        # password itself). :notfound when the account is unknown or has
+        # no derived credentials.
+        def scram_credentials(email)
+          @lock.synchronize do
+            account = @accounts.values.find { |a| a[:email] == normalize(email) }
+            scram = account&.dig(:scram)
+            return { error: "no scram credentials", code: :notfound } unless scram
+
+            {
+              account_id: account[:id],
+              email: account[:email],
+              salt_base64: [ scram[:salt] ].pack("m0"),
+              iterations: scram[:iterations],
+              stored_key_base64: [ scram[:stored_key] ].pack("m0"),
+              server_key_base64: [ scram[:server_key] ].pack("m0")
+            }
           end
         end
 

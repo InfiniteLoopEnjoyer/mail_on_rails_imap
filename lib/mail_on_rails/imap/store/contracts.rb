@@ -61,6 +61,23 @@ module MailOnRails
           def test_log_returns_nil
             assert_nil store.log(:info, "contract check")
           end
+
+          def test_scram_credentials_derive_from_the_account_password
+            require "mail_on_rails/imap/scram"
+            account_id
+            creds = store.scram_credentials(EMAIL)
+            assert_equal account_id, creds[:account_id]
+            assert_equal EMAIL, creds[:email]
+            assert_operator creds[:iterations], :>=, 4096
+
+            expected = MailOnRails::Imap::Scram.derive(
+              PASSWORD, salt: creds[:salt_base64].unpack1("m0"), iterations: creds[:iterations]
+            )
+            assert_equal [ expected[:stored_key] ].pack("m0"), creds[:stored_key_base64]
+            assert_equal [ expected[:server_key] ].pack("m0"), creds[:server_key_base64]
+
+            assert_equal :notfound, store.scram_credentials("nobody@example.test")[:code]
+          end
         end
 
         module Imap
