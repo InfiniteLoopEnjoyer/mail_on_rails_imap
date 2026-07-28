@@ -381,6 +381,75 @@ class ImapSessionTest < Minitest::Test
     end
   end
 
+  def test_enable_qresync_switches_expunge_to_vanished
+    @store.append(@account_id, "INBOX", RAW, [], nil) # uid 2
+    with_session do |client|
+      client.gets("\r\n")
+      command(client, "e1", "LOGIN #{EMAIL} #{PASSWORD}")
+      enabled = command(client, "e2", "ENABLE QRESYNC")
+      assert_match(/\A\* ENABLED QRESYNC\r\ne2 OK/, enabled)
+      command(client, "e3", "SELECT INBOX")
+
+      command(client, "e4", "STORE 1:2 +FLAGS.SILENT (\\Deleted)")
+      expunge = command(client, "e5", "EXPUNGE")
+      assert_match(/\A\* VANISHED 1:2\r\ne5 OK/, expunge)
+      refute_match(/EXPUNGE\r\n/, expunge[/\A.*(?=e5)/m].to_s, "QRESYNC sessions get VANISHED, not EXPUNGE")
+      command(client, "e6", "LOGOUT")
+    end
+  end
+
+  def test_select_qresync_param_reports_vanished_earlier_and_flag_changes
+    @store.append(@account_id, "INBOX", RAW, [ "\\Deleted" ], nil) # uid 2
+    with_session do |client|
+      client.gets("\r\n")
+      command(client, "q1", "LOGIN #{EMAIL} #{PASSWORD}")
+
+      # A client without ENABLE QRESYNC must be refused the parameter.
+      assert_match(/\Aq2 BAD/, command(client, "q2", "SELECT INBOX (QRESYNC (1 1))"))
+
+      command(client, "q3", "ENABLE QRESYNC")
+      select = command(client, "q4", "SELECT INBOX")
+      uidvalidity = select[/UIDVALIDITY (\d+)/, 1].to_i
+      known_modseq = select[/HIGHESTMODSEQ (\d+)/, 1].to_i
+
+      # Another session's changes while this client is "offline".
+      mailbox_id = @store.select_mailbox(@account_id, "INBOX")[:mailbox_id]
+      @store.expunge(mailbox_id)                              # uid 2 vanishes
+      @store.store_flags(mailbox_id, [ 1 ], "+", [ "\\Flagged" ]) # uid 1 changes
+
+      resync = command(client, "q5", "SELECT INBOX (QRESYNC (#{uidvalidity} #{known_modseq}))")
+      assert_match(/\* OK \[CLOSED\]/, resync)
+      assert_match(/\* VANISHED \(EARLIER\) 2\r\n/, resync)
+      assert_match(/\* 1 FETCH \(UID 1 FLAGS \([^)]*\\Flagged[^)]*\) MODSEQ \(\d+\)\)/, resync)
+
+      # Wrong UIDVALIDITY: no catch-up responses at all.
+      stale = command(client, "q6", "SELECT INBOX (QRESYNC (#{uidvalidity + 1} #{known_modseq}))")
+      refute_match(/VANISHED/, stale)
+      command(client, "q7", "LOGOUT")
+    end
+  end
+
+  def test_uid_fetch_vanished_modifier
+    @store.append(@account_id, "INBOX", RAW, [ "\\Deleted" ], nil) # uid 2
+    with_session do |client|
+      client.gets("\r\n")
+      command(client, "v1", "LOGIN #{EMAIL} #{PASSWORD}")
+      command(client, "v2", "ENABLE QRESYNC")
+      select = command(client, "v3", "SELECT INBOX")
+      baseline = select[/HIGHESTMODSEQ (\d+)/, 1].to_i
+
+      mailbox_id = @store.select_mailbox(@account_id, "INBOX")[:mailbox_id]
+      @store.expunge(mailbox_id) # uid 2 vanishes behind the session's back
+
+      fetch = command(client, "v4", "UID FETCH 1:* (FLAGS) (CHANGEDSINCE #{baseline} VANISHED)")
+      assert_match(/\A\* VANISHED \(EARLIER\) 2\r\n/, fetch)
+
+      # VANISHED without QRESYNC prerequisites is BAD.
+      assert_match(/\Av5 BAD/, command(client, "v5", "FETCH 1:* (FLAGS) (CHANGEDSINCE #{baseline} VANISHED)"))
+      command(client, "v6", "LOGOUT")
+    end
+  end
+
   def test_search_modseq_key_appends_highest_match_modseq
     with_session do |client|
       login_and_select(client)

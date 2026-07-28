@@ -111,6 +111,28 @@ module MailOnRails
             assert_equal :exists, store.rename_mailbox(account_id, "A", "Trash")[:code]
           end
 
+          def test_expunged_since_reports_tombstones_by_modseq
+            first = store.append(account_id, "INBOX", RAW_CRLF, [ "\\Deleted" ], nil)[:uid]
+            keep = store.append(account_id, "INBOX", RAW_CRLF, [], nil)[:uid]
+            mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
+
+            assert_equal [], store.expunged_since(mailbox_id, 0)[:uids]
+
+            before = store.status(account_id, "INBOX")[:highest_modseq]
+            store.expunge(mailbox_id)
+            result = store.expunged_since(mailbox_id, before)
+            assert_equal [ first ], result[:uids]
+            assert result[:complete]
+
+            # Nothing vanished after the expunge itself.
+            after = store.status(account_id, "INBOX")[:highest_modseq]
+            assert_equal [], store.expunged_since(mailbox_id, after)[:uids]
+
+            # MOVE leaves tombstones too.
+            store.move(mailbox_id, [ keep ], "Trash")
+            assert_equal [ first, keep ].sort, store.expunged_since(mailbox_id, before)[:uids].sort
+          end
+
           def test_move_transfers_messages_with_fresh_uids
             uid = store.append(account_id, "INBOX", RAW_CRLF, [ "\\Seen" ], nil)[:uid]
             mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]

@@ -22,7 +22,7 @@ module MailOnRails
   # encrypted (LOGINDISABLED advertised in the clear).
   class ImapServer < Imap::Server
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ID"
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID"
     FLAGS = "\\Answered \\Flagged \\Deleted \\Seen \\Draft"
     MAX_LITERAL_BYTES = 30 * 1024 * 1024
     # How often an idling session re-checks the store for changes. The
@@ -110,6 +110,9 @@ module MailOnRails
         # (CONDSTORE), FETCH MODSEQ/CHANGEDSINCE, STORE UNCHANGEDSINCE,
         # SEARCH MODSEQ), MODSEQ rides along in FETCH responses (RFC 7162).
         @condstore = false
+        # ENABLE QRESYNC switches expunge reporting from per-sequence
+        # EXPUNGE lines to uid-based VANISHED responses (RFC 7162).
+        @qresync = false
         @read_only = false
         @logout = false
       end
@@ -278,6 +281,7 @@ module MailOnRails
         when "AUTHENTICATE" then authenticate(tag, args)
         when "STARTTLS"     then starttls(tag)
         when "NAMESPACE"    then require_auth(tag) { namespace(tag) }
+        when "ENABLE"       then require_auth(tag) { enable(tag, args) }
         when "LIST"         then require_auth(tag) { list(tag, args, verb: "LIST") }
         when "LSUB"         then require_auth(tag) { list(tag, args, verb: "LSUB") }
         when "SUBSCRIBE", "UNSUBSCRIBE" then require_auth(tag) { tagged tag, "OK #{name} completed" }
@@ -398,6 +402,17 @@ module MailOnRails
         tagged tag, "OK NAMESPACE completed"
       end
 
+      # RFC 5161. Only extensions that change server behavior are
+      # enableable; QRESYNC implies CONDSTORE (RFC 7162).
+      def enable(tag, args)
+        requested = args.select { |a| a.is_a?(String) }.map(&:upcase)
+        enabled = requested & %w[CONDSTORE QRESYNC]
+        @condstore = true if enabled.any?
+        @qresync = true if enabled.include?("QRESYNC")
+        untagged "ENABLED#{enabled.empty? ? "" : " #{enabled.join(" ")}"}"
+        tagged tag, "OK ENABLE completed"
+      end
+
       # RFC 6154 well-known mailboxes, advertised via SPECIAL-USE
       # attributes so clients auto-map their folders.
       SPECIAL_USE = {
@@ -514,11 +529,19 @@ module MailOnRails
       def select(tag, args, read_only:)
         name = Imap::Utf7.decode(args.first.to_s)
         @condstore = true if args.any? { |a| a.is_a?(String) && a.casecmp?("CONDSTORE") }
+        qresync = parse_qresync_param(args)
+        return tagged(tag, "BAD QRESYNC parameter requires ENABLE QRESYNC") if qresync && !@qresync
+
+        was_selected = !@selected.nil?
         result = @store.select_mailbox(@account_id, name)
         if result[:error]
           @selected = nil
           return tagged(tag, "NO SELECT failed: no such mailbox")
         end
+
+        # RFC 7162 §3.2.11: QRESYNC sessions are told the previous mailbox
+        # is closed before any responses for the new one.
+        untagged "OK [CLOSED] Previous mailbox closed" if was_selected && @qresync
 
         @selected = { mailbox_id: result[:mailbox_id], name: result[:name] }
         @read_only = read_only
@@ -534,7 +557,42 @@ module MailOnRails
         untagged "OK [UIDVALIDITY #{result[:uid_validity]}] UIDs valid"
         untagged "OK [UIDNEXT #{result[:uid_next]}] Predicted next UID"
         untagged "OK [HIGHESTMODSEQ #{@highest_modseq}] Highest"
+        qresync_catch_up(qresync, result) if qresync
         tagged tag, "OK [#{read_only ? "READ-ONLY" : "READ-WRITE"}] #{read_only ? "EXAMINE" : "SELECT"} completed"
+      end
+
+      # Extracts "QRESYNC (uidvalidity modseq [known-uids [(seq-match)]])"
+      # from the SELECT parameter list; returns nil when absent.
+      def parse_qresync_param(args)
+        idx = args.index { |a| a.is_a?(String) && a.casecmp?("QRESYNC") }
+        return nil unless idx && args[idx + 1] == :lparen
+
+        values = args[(idx + 2)..].take_while { |a| a != :rparen && a != :lparen }
+        {
+          uid_validity: values[0].to_i,
+          modseq: values[1].to_i,
+          known_uids: values[2] # optional uid-set string or nil
+        }
+      end
+
+      # The QRESYNC fast-resync: VANISHED (EARLIER) for expunges the
+      # client missed, then FLAGS catch-up for messages changed since its
+      # last known modseq. Skipped entirely on a UIDVALIDITY mismatch -
+      # the client must do a full resync then.
+      def qresync_catch_up(qresync, result)
+        return unless qresync[:uid_validity] == result[:uid_validity]
+
+        known = qresync[:known_uids] && parse_ranges(qresync[:known_uids], result[:uid_next] - 1)
+        vanished = @store.expunged_since(@selected[:mailbox_id], qresync[:modseq])[:uids] || []
+        vanished = vanished.select { |uid| known.any? { |r| r.cover?(uid) } } if known
+        untagged "VANISHED (EARLIER) #{compress_set(vanished)}" if vanished.any?
+
+        @uids.each_with_index do |uid, idx|
+          next unless (@modseqs[uid] || 1) > qresync[:modseq]
+          next if known && known.none? { |r| r.cover?(uid) }
+
+          untagged "#{idx + 1} FETCH (UID #{uid} FLAGS (#{@flags[uid].join(" ")}) MODSEQ (#{@modseqs[uid]}))"
+        end
       end
 
       # Rows are [uid, flags, modseq]; modseq may be absent from a store
@@ -581,31 +639,45 @@ module MailOnRails
 
         result = @store.expunge(@selected[:mailbox_id], uids)
         removed = result[:uids] || []
-        @uids.each_with_index.to_a.reverse_each do |uid, idx|
-          next unless removed.include?(uid)
-
-          untagged "#{idx + 1} EXPUNGE"
-          @flags.delete(uid)
-        end
-        @uids -= removed
+        report_removed(removed)
         tagged tag, "OK EXPUNGE completed"
+      end
+
+      # Announces removals as either per-sequence EXPUNGE lines (highest
+      # first, so earlier lines don't renumber later ones) or a single
+      # uid-based VANISHED response once QRESYNC is enabled (RFC 7162).
+      def report_removed(removed)
+        return if removed.empty?
+
+        if @qresync
+          untagged "VANISHED #{compress_set(removed)}"
+        else
+          @uids.each_with_index.to_a.reverse_each do |uid, idx|
+            untagged "#{idx + 1} EXPUNGE" if removed.include?(uid)
+          end
+        end
+        removed.each { |uid| @flags.delete(uid); @modseqs.delete(uid) }
+        @uids -= removed
       end
 
       # -- message sets --------------------------------------------------------
 
       # Resolves an IMAP sequence set against the current mailbox snapshot.
       # Returns [[seq, uid], ...] in mailbox order.
-      def resolve_set(set, uid_mode)
-        return [] if @uids.empty?
-
-        max = uid_mode ? @uids.last : @uids.length
-        ranges = set.to_s.split(",").filter_map do |chunk|
+      def parse_ranges(set, max)
+        set.to_s.split(",").filter_map do |chunk|
           lo, hi = chunk.split(":", 2)
           lo = lo == "*" ? max : lo.to_i
           hi = hi.nil? ? lo : (hi == "*" ? max : hi.to_i)
           lo, hi = hi, lo if lo > hi
           (lo..hi)
         end
+      end
+
+      def resolve_set(set, uid_mode)
+        return [] if @uids.empty?
+
+        ranges = parse_ranges(set, uid_mode ? @uids.last : @uids.length)
         result = []
         @uids.each_with_index do |uid, idx|
           value = uid_mode ? uid : idx + 1
@@ -630,7 +702,11 @@ module MailOnRails
         set = args.shift
         return tagged(tag, "BAD FETCH expects a sequence set") unless set.is_a?(String)
 
-        changedsince = extract_changedsince(args)
+        changedsince, vanished = extract_fetch_modifiers(args)
+        if vanished && !(uid_mode && changedsince && @qresync)
+          return tagged(tag, "BAD VANISHED requires UID FETCH with CHANGEDSINCE after ENABLE QRESYNC")
+        end
+
         items = args.take_while { |a| a != :rparen }.reject { |a| a == :lparen }.map { |a| a.to_s }
         items = items.flat_map { |i| FETCH_MACROS[i.upcase] || [ i ] }
         items << "UID" if uid_mode && items.none? { |i| i.casecmp?("UID") }
@@ -638,6 +714,13 @@ module MailOnRails
 
         @condstore = true if changedsince || items.any? { |i| i.casecmp?("MODSEQ") }
         items << "MODSEQ" if @condstore && items.none? { |i| i.casecmp?("MODSEQ") }
+
+        if vanished
+          gone = @store.expunged_since(@selected[:mailbox_id], changedsince)[:uids] || []
+          ranges = parse_ranges(set, @uids.last || 0)
+          gone = gone.select { |uid| ranges.any? { |r| r.cover?(uid) } }
+          untagged "VANISHED (EARLIER) #{compress_set(gone)}" if gone.any?
+        end
 
         wanted = resolve_set(set, uid_mode)
         wanted = wanted.select { |_seq, uid| (@modseqs[uid] || 1) > changedsince } if changedsince
@@ -652,17 +735,19 @@ module MailOnRails
         tagged tag, "OK FETCH completed"
       end
 
-      # Pulls the RFC 7162 "(CHANGEDSINCE n)" modifier group out of the
-      # argument list (it follows the item list) and returns n, or nil.
-      def extract_changedsince(args)
+      # Pulls the RFC 7162 "(CHANGEDSINCE n [VANISHED])" modifier group
+      # out of the argument list (it follows the item list); returns
+      # [n, vanished?] or [nil, false].
+      def extract_fetch_modifiers(args)
         idx = args.index { |a| a.is_a?(String) && a.casecmp?("CHANGEDSINCE") }
-        return nil unless idx
+        return [ nil, false ] unless idx
 
         value = args[idx + 1].to_i
-        first = idx.positive? && args[idx - 1] == :lparen ? idx - 1 : idx
-        last = args[idx + 2] == :rparen ? idx + 2 : idx + 1
-        args.slice!(first..last)
-        value
+        first = args[0..idx].rindex(:lparen) || idx
+        last = args[(idx + 1)..].index(:rparen)
+        last = last ? idx + 1 + last : idx + 1
+        group = args.slice!(first..last)
+        [ value, group.any? { |a| a.is_a?(String) && a.casecmp?("VANISHED") } ]
       end
 
       def fetch_messages(uids, with_raw)
@@ -844,14 +929,7 @@ module MailOnRails
 
         # RFC 6851: COPYUID rides an untagged OK and precedes the EXPUNGEs.
         untagged "OK [COPYUID #{result[:uid_validity]} #{result[:src_uids].join(",")} #{result[:dest_uids].join(",")}]"
-        moved = result[:src_uids]
-        @uids.each_with_index.to_a.reverse_each do |uid, idx|
-          next unless moved.include?(uid)
-
-          untagged "#{idx + 1} EXPUNGE"
-          @flags.delete(uid)
-        end
-        @uids -= moved
+        report_removed(result[:src_uids])
         tagged tag, "OK MOVE completed"
       end
 
@@ -1194,8 +1272,12 @@ module MailOnRails
         removed = @uids - new_uids
         added = new_uids - @uids
 
-        @uids.each_with_index.to_a.reverse_each do |uid, idx|
-          untagged "#{idx + 1} EXPUNGE" if removed.include?(uid)
+        if @qresync
+          untagged "VANISHED #{compress_set(removed)}" if removed.any?
+        else
+          @uids.each_with_index.to_a.reverse_each do |uid, idx|
+            untagged "#{idx + 1} EXPUNGE" if removed.include?(uid)
+          end
         end
         take_snapshot(result)
         untagged "#{@uids.length} EXISTS" if removed.any? || added.any?

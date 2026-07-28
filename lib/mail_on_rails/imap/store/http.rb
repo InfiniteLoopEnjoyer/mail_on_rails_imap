@@ -95,6 +95,10 @@ module MailOnRails
           op(:move, mailbox_id: mailbox_id, uids: uids, dest_name: dest_name)
         end
 
+        def expunged_since(mailbox_id, since_modseq)
+          op(:expunged_since, mailbox_id: mailbox_id, since_modseq: since_modseq)
+        end
+
         private
 
         def op(name, payload)

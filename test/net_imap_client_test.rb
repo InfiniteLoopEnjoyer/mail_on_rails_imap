@@ -150,6 +150,21 @@ class NetImapClientTest < Minitest::Test
     end
   end
 
+  def test_qresync_enable_and_vanished_parsing
+    @store.append(@account_id, "INBOX", RAW, [], nil) # uid 2
+    with_client do |imap|
+      imap.authenticate("PLAIN", EMAIL, PASSWORD)
+      assert_equal [ "QRESYNC" ], imap.enable("QRESYNC")
+      imap.select("INBOX")
+
+      imap.uid_store(1..2, "+FLAGS.SILENT", [ :Deleted ])
+      vanished = imap.expunge
+      assert_kind_of Net::IMAP::VanishedData, vanished
+      assert_equal [ 1, 2 ], vanished.uids.numbers
+      refute vanished.earlier
+    end
+  end
+
   def test_idle_receives_exists_update
     poll = MailOnRails::ImapServer::IDLE_POLL_SECONDS
     MailOnRails::ImapServer.send(:remove_const, :IDLE_POLL_SECONDS)

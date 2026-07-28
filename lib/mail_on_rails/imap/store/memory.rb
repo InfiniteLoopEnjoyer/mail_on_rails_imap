@@ -16,11 +16,15 @@ module MailOnRails
       # provision credentials.
       class Memory
         DEFAULT_MAILBOXES = %w[INBOX Sent Drafts Trash Junk].freeze
+        # Expunge tombstones kept per mailbox for QRESYNC's VANISHED
+        # (EARLIER); beyond this the oldest are pruned and the floor rises.
+        TOMBSTONE_LIMIT = 1000
 
-        def initialize(logger: nil)
+        def initialize(logger: nil, tombstone_limit: TOMBSTONE_LIMIT)
           @logger = logger
           @accounts = {} # id => { id:, email:, password:, mailboxes: { name => mailbox } }
           @counters = Hash.new(0)
+          @tombstone_limit = tombstone_limit
           @lock = Monitor.new
         end
 
@@ -177,8 +181,9 @@ module MailOnRails
               m[:flags].include?("\\Deleted") && (uids.nil? || uids.include?(m[:uid]))
             end
             mailbox[:messages] = kept
-            next_modseq(mailbox) if doomed.any?
-            { uids: doomed.map { |m| m[:uid] }.sort }
+            removed = doomed.map { |m| m[:uid] }.sort
+            add_tombstones(mailbox, removed)
+            { uids: removed }
           end
         end
 
@@ -214,6 +219,25 @@ module MailOnRails
           end
         end
 
+        # QRESYNC: uids expunged after since_modseq. complete: false means
+        # tombstone history was pruned past since_modseq, so the answer
+        # falls back to every uid ever allocated but no longer present
+        # (uids are never reused, so that set is correct, just larger).
+        def expunged_since(mailbox_id, since_modseq)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            return { uids: [], complete: true } unless mailbox
+
+            if since_modseq >= mailbox[:tombstone_floor]
+              uids = mailbox[:tombstones].filter_map { |uid, modseq| uid if modseq > since_modseq }
+              { uids: uids.sort.uniq, complete: true }
+            else
+              present = mailbox[:messages].map { |m| m[:uid] }
+              { uids: (1...mailbox[:uid_next]).to_a - present, complete: false }
+            end
+          end
+        end
+
         # Atomic copy+remove (RFC 6851 MOVE): the message never exists in
         # both mailboxes from an observer's point of view.
         def move(mailbox_id, uids, dest_name)
@@ -234,7 +258,7 @@ module MailOnRails
               dest_uids << copied[:uid]
             end
             source[:messages] = source[:messages].reject { |m| src_uids.include?(m[:uid]) }
-            next_modseq(source) if src_uids.any?
+            add_tombstones(source, src_uids)
             { uid_validity: dest[:uid_validity], src_uids: src_uids, dest_uids: dest_uids }
           end
         end
@@ -251,7 +275,23 @@ module MailOnRails
 
         def new_mailbox(name)
           { id: next_id(:mailbox), name: name, uid_validity: Time.now.to_i, uid_next: 1,
-            highest_modseq: 1, messages: [] }
+            highest_modseq: 1, messages: [], tombstones: [], tombstone_floor: 0 }
+        end
+
+        # Records [uid, modseq] for an expunged message, pruning history
+        # beyond the limit; the floor remembers the highest pruned modseq
+        # so expunged_since can tell precise answers from truncated ones.
+        def add_tombstones(mailbox, uids)
+          return if uids.empty?
+
+          modseq = next_modseq(mailbox)
+          uids.each { |uid| mailbox[:tombstones] << [ uid, modseq ] }
+          overflow = mailbox[:tombstones].length - @tombstone_limit
+          if overflow.positive?
+            pruned = mailbox[:tombstones].shift(overflow)
+            mailbox[:tombstone_floor] = [ mailbox[:tombstone_floor], pruned.map(&:last).max ].max
+          end
+          modseq
         end
 
         # Every mutation of a mailbox's contents gets the next per-mailbox

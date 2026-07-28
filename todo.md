@@ -61,9 +61,16 @@ Rule: every item lands with tests.
       SEARCH MODSEQ with (MODSEQ n) response, STATUS HIGHESTMODSEQ
       (requested-only). Verified via net-imap's condstore:/changedsince:/
       unchangedsince: APIs.
-- [ ] QRESYNC — needs expunged-UID tombstones (uid+modseq log) for
-      VANISHED (EARLIER), ENABLE QRESYNC, SELECT QRESYNC params. Next
-      logical step after CONDSTORE; requires a new table or expunge log.
+- [x] QRESYNC (RFC 7162) — DONE 2026-07-27: expunge tombstones (uid+modseq,
+      1000/mailbox, pruning raises tombstone_floor; below the floor
+      expunged_since over-reports with every-missing-uid, which is correct
+      since uids are never reused). ENABLE (RFC 5161) with ENABLED response;
+      SELECT (QRESYNC (uidvalidity modseq [known-uids])) emits VANISHED
+      (EARLIER) + FLAGS/MODSEQ catch-up, skipped on UIDVALIDITY mismatch;
+      OK [CLOSED] on mailbox switch; EXPUNGE/MOVE/resync report uid-based
+      VANISHED instead of EXPUNGE once enabled; UID FETCH (CHANGEDSINCE n
+      VANISHED). Rails: expunged_messages table + mailboxes.tombstone_floor
+      (migration 20260727230000), EmailMessage#record_tombstone.
 - [ ] AUTH=SCRAM-SHA-256 — server needs per-account salt/iterations/
       StoredKey/ServerKey, derived at password-set time in the Rails app
       (bcrypt hash alone can't do SCRAM). New store op to fetch SCRAM creds.
