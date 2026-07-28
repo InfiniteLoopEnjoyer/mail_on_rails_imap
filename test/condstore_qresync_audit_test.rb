@@ -1,6 +1,5 @@
 require "test_helper"
-require "mail_on_rails/imap_server"
-require "mail_on_rails/imap/store/memory"
+require "wire_harness"
 
 # RFC 7162 (CONDSTORE/QRESYNC) compliance audit, ported from mox's
 # imapserver/condstore_test.go — the same wire-level style as
@@ -10,66 +9,9 @@ require "mail_on_rails/imap/store/memory"
 # cases that depend on its database internals (legacy modseq-0 rows,
 # UIDONLY) are not ported.
 class CondstoreQresyncAuditTest < Minitest::Test
-  EMAIL = "user@example.test"
-  PASSWORD = "pw-123456"
+  include WireHarness
+
   RAW = "From: sender@remote.test\r\nSubject: hi\r\n\r\nbody line\r\n"
-
-  def setup
-    @store = MailOnRails::Imap::Store::Memory.new
-    @account_id = @store.add_account(email: EMAIL, password: PASSWORD)
-    @listener = TCPServer.new("127.0.0.1", 0)
-    @sessions = []
-    @clients = []
-    @acceptor = Thread.new do
-      loop do
-        sock = @listener.accept
-        @sessions << Thread.new { MailOnRails::ImapServer::Session.new(sock, @store, { tls: :implicit }, nil).run }
-      end
-    rescue IOError, SystemCallError
-      # listener closed in teardown
-    end
-  end
-
-  def teardown
-    @clients.each { |c| c.close rescue nil }
-    @listener.close
-    @acceptor.join(2)
-    @sessions.each { |t| t.join(5) }
-  end
-
-  def connect(login: true)
-    client = TCPSocket.new("127.0.0.1", @listener.addr[1])
-    @clients << client
-    client.gets("\r\n") # greeting
-    command(client, "l0", "LOGIN #{EMAIL} #{PASSWORD}") if login
-    client
-  end
-
-  def read_until_tagged(client, tag)
-    lines = []
-    while (line = client.gets("\r\n"))
-      lines << line
-      break if line.start_with?("#{tag} ")
-    end
-    lines.join
-  end
-
-  def command(client, tag, line)
-    client.write("#{tag} #{line}\r\n")
-    read_until_tagged(client, tag)
-  end
-
-  def inbox_id
-    @store.select_mailbox(@account_id, "INBOX")[:mailbox_id]
-  end
-
-  def highest_modseq
-    @store.status(@account_id, "INBOX")[:highest_modseq]
-  end
-
-  def fetch_modseq(client, tag, seq)
-    command(client, tag, "FETCH #{seq} (MODSEQ)")[/MODSEQ \((\d+)\)/, 1].to_i
-  end
 
   # -- empty-mailbox basics (mox testCondstoreQresync head) ------------------
 

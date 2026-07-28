@@ -179,10 +179,13 @@ module MailOnRails
             mailbox = mailbox_by_id(mailbox_id)
             messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
             updated = messages.map do |m|
+              # Flags are case-insensitive atoms: adding "Custom1" to a
+              # message flagged "custom1" is a no-op, and removing it
+              # matches regardless of case (first-seen spelling is kept).
               new_flags =
                 case mode
-                when "+" then (m[:flags] | flags)
-                when "-" then (m[:flags] - flags)
+                when "+" then m[:flags] + flags.reject { |f| m[:flags].any? { |e| e.casecmp?(f) } }
+                when "-" then m[:flags].reject { |e| flags.any? { |f| e.casecmp?(f) } }
                 else flags.dup
                 end
               # A store that changes nothing gets no new modseq: clients

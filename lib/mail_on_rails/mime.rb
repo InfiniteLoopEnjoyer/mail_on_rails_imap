@@ -53,8 +53,13 @@ module MailOnRails
     end
 
     # Returns [header block including the delimiting blank line, body].
+    # A message (or MIME part) may have no headers at all, in which case
+    # it opens directly with the blank line (RFC 2046 §5.1: "a blank line
+    # ... means no header fields were given").
     def split_header(raw)
-      if (m = raw.match(/\r?\n\r?\n/))
+      if (m = raw.match(/\A\r?\n/))
+        [ raw[0...m.end(0)], raw[m.end(0)..] || (+"").b ]
+      elsif (m = raw.match(/\r?\n\r?\n/))
         [ raw[0...m.end(0)], raw[m.end(0)..] || (+"").b ]
       else
         [ raw, (+"").b ]
@@ -188,9 +193,15 @@ module MailOnRails
 
     # -- BODYSTRUCTURE / ENVELOPE -------------------------------------------
 
-    def bodystructure(part)
+    # BODY is the plain form; BODYSTRUCTURE (extended: true) appends the
+    # RFC 3501 extension data - body-fld-md5/dsp/lang/loc for single
+    # parts, body-fld-param/dsp/lang/loc for multiparts. Clients use the
+    # disposition data to list attachments without downloading bodies.
+    def bodystructure(part, extended: false)
       if part.multipart? && part.children
-        "(#{part.children.map { |c| bodystructure(c) }.join} #{quote(part.subtype.upcase)})"
+        fields = [ "#{part.children.map { |c| bodystructure(c, extended: extended) }.join} #{quote(part.subtype.upcase)}" ]
+        fields << params_list(part.params) << disposition(part) << language(part) << location(part) if extended
+        "(#{fields.join(" ")})"
       else
         fields = [
           quote(part.type.upcase),
@@ -202,12 +213,42 @@ module MailOnRails
           part.size.to_s
         ]
         if part.message_rfc822? && part.embedded
-          fields << envelope(part.embedded) << bodystructure(part.embedded) << part.line_count.to_s
+          fields << envelope(part.embedded) << bodystructure(part.embedded, extended: extended) << part.line_count.to_s
         elsif part.type == "text"
           fields << part.line_count.to_s
         end
+        if extended
+          fields << nstring(part.headers["content-md5"]&.first)
+          fields << disposition(part) << language(part) << location(part)
+        end
         "(#{fields.join(" ")})"
       end
+    end
+
+    # body-fld-dsp: ("inline"/"attachment" (params)) or NIL.
+    def disposition(part)
+      value = part.headers["content-disposition"]&.first
+      return "NIL" if value.nil? || value.strip.empty?
+
+      type = value.split(";", 2).first.to_s.strip
+      params = {}
+      value.split(";", 2)[1].to_s.scan(/([\w-]+)\s*=\s*(?:"((?:\\.|[^"\\])*)"|([^;\s]+))/) do |name, quoted, token|
+        params[name.downcase] = quoted ? quoted.gsub(/\\(.)/, '\1') : token
+      end
+      "(#{quote(type.upcase)} #{params.empty? ? "NIL" : params_list(params)})"
+    end
+
+    # body-fld-lang: NIL, a single language tag, or a parenthesized list.
+    def language(part)
+      value = part.headers["content-language"]&.first
+      return "NIL" if value.nil? || value.strip.empty?
+
+      langs = value.split(",").map(&:strip).reject(&:empty?)
+      langs.length == 1 ? quote(langs.first) : "(#{langs.map { |l| quote(l) }.join(" ")})"
+    end
+
+    def location(part)
+      nstring(part.headers["content-location"]&.first)
     end
 
     def params_list(params)

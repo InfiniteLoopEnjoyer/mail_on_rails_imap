@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "strscan"
+require "date"
 require "time"
 require "securerandom"
 require "mail_on_rails/imap/scram"
@@ -838,19 +839,70 @@ module MailOnRails
 
       METADATA_ITEMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ].freeze
 
+      FETCH_ITEM_ATOMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY
+                            BODYSTRUCTURE RFC822 RFC822.HEADER RFC822.TEXT MODSEQ].freeze
+
+      # Validates a FETCH data item: a known atom, or BODY[.PEEK][section]
+      # with an optional <origin.count> partial (count mandatory and
+      # nonzero per the RFC 3501 grammar).
+      def valid_fetch_item?(item)
+        return true if FETCH_ITEM_ATOMS.include?(item.upcase)
+
+        m = item.match(/\ABODY(?:\.PEEK)?\[(.*)\](<(\d+)(?:\.(\d+))?>)?\z/im) or return false
+        return false if m[2] && (m[4].nil? || m[4].to_i.zero?)
+
+        valid_fetch_section?(m[1])
+      end
+
+      # Section grammar: optional dotted part numbers, then nothing or
+      # HEADER / TEXT / MIME (MIME only after a part number) /
+      # HEADER.FIELDS[.NOT] with a non-empty header list.
+      def valid_fetch_section?(spec)
+        numbers, rest = spec.match(/\A((?:\d+\.)*\d+)?\.?(.*)\z/m).captures
+        return true if rest.to_s.empty?
+
+        case rest.upcase
+        when "HEADER", "TEXT" then true
+        when "MIME" then !numbers.nil?
+        else rest.match?(/\AHEADER\.FIELDS(?:\.NOT)?\s+\(\s*\S[^)]*\)\z/i)
+        end
+      end
+
+      # RFC 9051 (seq-number): a numeric message sequence number beyond
+      # the number of messages in the mailbox gets a tagged BAD. Chunks
+      # containing "*" clamp to the mailbox instead of failing.
+      def bad_seq?(set, uid_mode)
+        return false if uid_mode
+
+        set.to_s.split(",").any? do |chunk|
+          next false if chunk.include?("*")
+
+          chunk.split(":", 2).any? { |n| n.to_i < 1 || n.to_i > @uids.length }
+        end
+      end
+
       def fetch(tag, args, uid_mode)
         set = args.shift
         return tagged(tag, "BAD FETCH expects a sequence set") unless set.is_a?(String)
+        return tagged(tag, "BAD Message sequence number out of range") if bad_seq?(set, uid_mode)
 
         changedsince, vanished = extract_fetch_modifiers(args)
         if vanished && !(uid_mode && changedsince && @qresync)
           return tagged(tag, "BAD VANISHED requires UID FETCH with CHANGEDSINCE after ENABLE QRESYNC")
         end
 
+        # Macros are only valid as a single bare word, never inside a
+        # parenthesized item list (RFC 3501 grammar).
+        parenthesized = args.first == :lparen
         items = args.take_while { |a| a != :rparen }.reject { |a| a == :lparen }.map { |a| a.to_s }
-        items = items.flat_map { |i| FETCH_MACROS[i.upcase] || [ i ] }
+        if !parenthesized && items.length == 1 && FETCH_MACROS.key?(items.first.upcase)
+          items = FETCH_MACROS[items.first.upcase].dup
+        end
         items << "UID" if uid_mode && items.none? { |i| i.casecmp?("UID") }
         return tagged(tag, "BAD FETCH expects data items") if items.empty?
+        if (bad = items.find { |i| !valid_fetch_item?(i) })
+          return tagged(tag, "BAD Unknown FETCH item #{bad}")
+        end
 
         @condstore = true if changedsince || items.any? { |i| i.casecmp?("MODSEQ") }
         items << "MODSEQ" if @condstore && items.none? { |i| i.casecmp?("MODSEQ") }
@@ -939,7 +991,8 @@ module MailOnRails
           when "INTERNALDATE"  then out << %(INTERNALDATE "#{internal_date(msg)}")
           when "RFC822.SIZE"   then out << "RFC822.SIZE #{msg[:size]}"
           when "ENVELOPE"      then out << "ENVELOPE #{Mime.envelope(parse.call)}"
-          when "BODY", "BODYSTRUCTURE" then out << "#{item.upcase} #{Mime.bodystructure(parse.call)}"
+          when "BODY" then out << "BODY #{Mime.bodystructure(parse.call)}"
+          when "BODYSTRUCTURE" then out << "BODYSTRUCTURE #{Mime.bodystructure(parse.call, extended: true)}"
           when "RFC822"        then out << "RFC822 #{Mime.literal(msg[:raw])}"
           when "RFC822.HEADER" then out << "RFC822.HEADER #{Mime.literal(parse.call.header_block)}"
           when "RFC822.TEXT"   then out << "RFC822.TEXT #{Mime.literal(parse.call.body)}"
@@ -988,6 +1041,7 @@ module MailOnRails
         end
         item = args.shift
         return tagged(tag, "BAD STORE expects a sequence set and item") unless set.is_a?(String) && item.is_a?(String)
+        return tagged(tag, "BAD Message sequence number out of range") if bad_seq?(set, uid_mode)
         return tagged(tag, "NO Mailbox is read-only") if @read_only
 
         m = item.match(/\A([+-]?)FLAGS(\.SILENT)?\z/i)
@@ -1039,6 +1093,7 @@ module MailOnRails
       def copy(tag, args, uid_mode)
         set, dest = args
         return tagged(tag, "BAD COPY expects a sequence set and mailbox") unless set.is_a?(String) && dest.is_a?(String)
+        return tagged(tag, "BAD Message sequence number out of range") if bad_seq?(set, uid_mode)
 
         wanted = resolve_set(set, uid_mode)
         return tagged(tag, "OK COPY completed (nothing to copy)") if wanted.empty?
@@ -1058,6 +1113,7 @@ module MailOnRails
       def move(tag, args, uid_mode)
         set, dest = args
         return tagged(tag, "BAD MOVE expects a sequence set and mailbox") unless set.is_a?(String) && dest.is_a?(String)
+        return tagged(tag, "BAD Message sequence number out of range") if bad_seq?(set, uid_mode)
         return tagged(tag, "NO Mailbox is read-only") if @read_only
 
         wanted = resolve_set(set, uid_mode)
@@ -1286,25 +1342,28 @@ module MailOnRails
         SearchKey.new(key.raw?, ->(seq, msg) { !key.call(seq, msg) })
       end
 
+      # Flags are grammar atoms and therefore case-insensitive (RFC 9051
+      # formal-syntax rules): KEYWORD Custom1 matches a stored "custom1".
       def flag_key(flag)
-        meta_key { |_seq, msg| (@flags[msg[:uid]] || msg[:flags]).include?(flag) }
+        meta_key { |_seq, msg| (@flags[msg[:uid]] || msg[:flags]).any? { |f| f.casecmp?(flag) } }
       end
 
       def date_key(str, &compare)
         day = parse_search_date(str)
-        meta_key { |_seq, msg| compare.call(msg[:internal_date] / 86_400, day) }
+        meta_key { |_seq, msg| compare.call(Time.at(msg[:internal_date]).utc.to_date, day) }
       end
 
       # SENTBEFORE/SENTON/SENTSINCE compare against the Date: header
-      # (RFC 3501), not INTERNALDATE. Messages without a parseable Date
-      # header don't match.
+      # (RFC 3501), not INTERNALDATE, "disregarding time and timezone":
+      # the date is taken as written in the header, never shifted to UTC.
+      # Messages without a parseable Date header don't match.
       def sent_date_key(str, &compare)
         day = parse_search_date(str)
         raw_key do |_seq, msg|
           value = Mime.parse_headers(Mime.split_header(msg[:raw].to_s)[0])["date"]&.first
           sent_day = begin
-            value && Time.parse(value).to_i / 86_400
-          rescue ArgumentError
+            value && Date.parse(value)
+          rescue ArgumentError, TypeError
             nil
           end
           !sent_day.nil? && compare.call(sent_day, day)
@@ -1312,7 +1371,7 @@ module MailOnRails
       end
 
       def parse_search_date(str)
-        Time.strptime(str.to_s, "%d-%b-%Y").to_i / 86_400
+        Date.strptime(str.to_s, "%d-%b-%Y")
       rescue ArgumentError
         raise SearchSyntaxError, "Invalid date #{str}"
       end
