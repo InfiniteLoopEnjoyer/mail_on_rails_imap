@@ -61,6 +61,11 @@ module MailOnRails
       def self.spawn_ractor(session_class:, specs:, tls_material:, store_config:, release_fd:, ready_port:)
         ractor = Ractor.new(session_class, specs, tls_material, store_config,
                             release_fd, ready_port) do |session_class, specs, tls_material, store_config, release_fd, ready_port|
+          # $stdout is ractor-local: it arrives here as a fresh unsynced
+          # wrapper of fd 1 (bin/server's boot-time sync doesn't carry
+          # over, and STDOUT isn't accessible off the main Ractor), so an
+          # unsynced pipe would buffer session log lines for hours.
+          $stdout.sync = true
           control_r, control_w = IO.pipe
           ready_port.send(control_w.fileno)
 
