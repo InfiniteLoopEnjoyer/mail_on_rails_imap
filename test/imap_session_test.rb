@@ -166,7 +166,7 @@ class ImapSessionTest < Minitest::Test
       with_session do |client|
         login_and_select(client)
         refused = command(client, "a1", "APPEND INBOX {200}")
-        assert_match(/\Aa1 NO literal too large/, refused)
+        assert_match(/\Aa1 NO \[TOOBIG\] literal too large/, refused)
         assert_match(/\Aa2 OK/, command(client, "a2", "NOOP"))
         command(client, "a3", "LOGOUT")
       end
@@ -183,7 +183,7 @@ class ImapSessionTest < Minitest::Test
         payload = "x9 STORE 1 +FLAGS (\\Deleted)\r\n" * 7
         payload = payload[0, 200]
         client.write("a1 APPEND INBOX {200+}\r\n#{payload}\r\n")
-        assert_match(/\Aa1 NO literal too large/, read_until_tagged(client, "a1"))
+        assert_match(/\Aa1 NO \[TOOBIG\] literal too large/, read_until_tagged(client, "a1"))
         assert_match(/\Aa2 OK/, command(client, "a2", "NOOP"))
         command(client, "a3", "LOGOUT")
       end

@@ -24,10 +24,14 @@ module MailOnRails
   # implicit-TLS port; credentials are refused until the channel is
   # encrypted (LOGINDISABLED advertised in the clear).
   class ImapServer < Imap::Server
-    # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE SEARCHRES"
     FLAGS = "\\Answered \\Flagged \\Deleted \\Seen \\Draft"
     MAX_LITERAL_BYTES = 30 * 1024 * 1024
+    # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
+    # APPENDLIMIT=<n> (RFC 7889) advertises one upload limit for every
+    # mailbox - the same cap the literal reader enforces.
+    # Interpolation defeats the frozen_string_literal magic comment; the
+    # explicit freeze keeps this Ractor-shareable for worker Ractors.
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE SEARCHRES APPENDLIMIT=#{MAX_LITERAL_BYTES}".freeze
     # How often an idling session re-checks the store for changes. The
     # store is the source of truth and other writers (delivery through the
     # Rails app, other sessions, possibly other daemon processes) don't
@@ -230,7 +234,9 @@ module MailOnRails
           size = m[1].to_i
           non_sync = !m[2].nil?
         end
-        tagged tag, "NO literal too large"
+        # RFC 7889/4469: over-limit uploads get the TOOBIG response code
+        # so clients report "too large" instead of retrying.
+        tagged tag, "NO [TOOBIG] literal too large"
         read_command
       end
 
@@ -688,7 +694,7 @@ module MailOnRails
         tagged tag, "OK RENAME completed"
       end
 
-      STATUS_ATTRS = %w[MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ SIZE].freeze
+      STATUS_ATTRS = %w[MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ SIZE APPENDLIMIT].freeze
 
       def status(tag, args)
         name = Imap::Utf7.decode(args.shift.to_s)
@@ -723,7 +729,8 @@ module MailOnRails
           "UIDNEXT" => result[:uid_next],
           "UIDVALIDITY" => result[:uid_validity],
           "HIGHESTMODSEQ" => result[:highest_modseq] || 1,
-          "SIZE" => result[:size] || 0
+          "SIZE" => result[:size] || 0,
+          "APPENDLIMIT" => MAX_LITERAL_BYTES
         }
         pairs = items.map { |i| "#{i} #{values[i]}" }
         untagged "STATUS #{Mime.quote(Imap::Utf7.encode(name))} (#{pairs.join(" ")})"
