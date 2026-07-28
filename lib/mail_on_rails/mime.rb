@@ -318,6 +318,54 @@ module MailOnRails
       tokens << current
     end
 
+    # -- PREVIEW (RFC 8970) --------------------------------------------------
+
+    PREVIEW_MAX_CHARS = 200
+    PREVIEW_MAX_OCTETS = 256
+
+    # A short plain-text rendition of the message body for list views:
+    # the first text part (multipart/alternative lists plain before html,
+    # so plain wins), transfer-decoded, tags stripped for html, charset
+    # coerced to UTF-8, whitespace collapsed, then capped at 200 chars /
+    # 256 octets per the RFC.
+    def preview(part)
+      target = first_text_part(part)
+      return "" unless target
+
+      text = decode_transfer_encoding(target)
+      text = text.gsub(/<[^>]*>/, " ") if target.subtype == "html"
+      charset = target.params["charset"] || "US-ASCII"
+      text = begin
+        text.force_encoding(charset).encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+      rescue StandardError
+        text.dup.force_encoding(Encoding::UTF_8)
+      end
+      text = text.scrub.gsub(/\s+/, " ").strip[0, PREVIEW_MAX_CHARS]
+      text = text[0..-2] while text.bytesize > PREVIEW_MAX_OCTETS
+      text
+    end
+
+    def first_text_part(part)
+      part = part.embedded if part.message_rfc822? && part.embedded
+      if part.multipart? && part.children
+        part.children.each do |child|
+          found = first_text_part(child)
+          return found if found
+        end
+        nil
+      elsif part.type == "text"
+        part
+      end
+    end
+
+    def decode_transfer_encoding(part)
+      case part.encoding.downcase
+      when "base64" then part.body.unpack1("m").to_s
+      when "quoted-printable" then part.body.unpack1("M").to_s
+      else part.body.dup
+      end
+    end
+
     # -- IMAP string encoding ------------------------------------------------
 
     def nstring(str)

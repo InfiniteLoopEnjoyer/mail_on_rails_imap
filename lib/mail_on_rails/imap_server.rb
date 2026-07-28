@@ -31,7 +31,7 @@ module MailOnRails
     # mailbox - the same cap the literal reader enforces.
     # Interpolation defeats the frozen_string_literal magic comment; the
     # explicit freeze keeps this Ractor-shareable for worker Ractors.
-    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE SEARCHRES APPENDLIMIT=#{MAX_LITERAL_BYTES}".freeze
+    BASE_CAPABILITIES = "IMAP4rev1 UIDPLUS LITERAL+ IDLE MOVE UNSELECT NAMESPACE SPECIAL-USE CHILDREN ESEARCH WITHIN CONDSTORE ENABLE QRESYNC ID LIST-STATUS STATUS=SIZE SEARCHRES OBJECTID SAVEDATE PREVIEW APPENDLIMIT=#{MAX_LITERAL_BYTES}".freeze
     # How often an idling session re-checks the store for changes. The
     # store is the source of truth and other writers (delivery through the
     # Rails app, other sessions, possibly other daemon processes) don't
@@ -617,7 +617,9 @@ module MailOnRails
         if result[:error]
           tagged tag, "NO #{result[:code] == :exists ? "[ALREADYEXISTS] " : ""}CREATE failed: #{result[:error]}"
         else
-          tagged tag, "OK CREATE completed"
+          # RFC 8474: the new mailbox's object id rides the tagged OK.
+          code = result[:mailbox_object_id] ? "[MAILBOXID (#{result[:mailbox_object_id]})] " : ""
+          tagged tag, "OK #{code}CREATE completed"
         end
       end
 
@@ -694,7 +696,7 @@ module MailOnRails
         tagged tag, "OK RENAME completed"
       end
 
-      STATUS_ATTRS = %w[MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ SIZE APPENDLIMIT].freeze
+      STATUS_ATTRS = %w[MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ SIZE APPENDLIMIT MAILBOXID].freeze
 
       def status(tag, args)
         name = Imap::Utf7.decode(args.shift.to_s)
@@ -730,7 +732,8 @@ module MailOnRails
           "UIDVALIDITY" => result[:uid_validity],
           "HIGHESTMODSEQ" => result[:highest_modseq] || 1,
           "SIZE" => result[:size] || 0,
-          "APPENDLIMIT" => MAX_LITERAL_BYTES
+          "APPENDLIMIT" => MAX_LITERAL_BYTES,
+          "MAILBOXID" => "(#{result[:mailbox_object_id]})"
         }
         pairs = items.map { |i| "#{i} #{values[i]}" }
         untagged "STATUS #{Mime.quote(Imap::Utf7.encode(name))} (#{pairs.join(" ")})"
@@ -773,6 +776,7 @@ module MailOnRails
         untagged "OK [UIDVALIDITY #{result[:uid_validity]}] UIDs valid"
         untagged "OK [UIDNEXT #{result[:uid_next]}] Predicted next UID"
         untagged "OK [HIGHESTMODSEQ #{@highest_modseq}] Highest"
+        untagged "OK [MAILBOXID (#{result[:mailbox_object_id]})] Ok" if result[:mailbox_object_id]
         qresync_catch_up(qresync, result) if qresync
         tagged tag, "OK [#{read_only ? "READ-ONLY" : "READ-WRITE"}] #{read_only ? "EXAMINE" : "SELECT"} completed"
       end
@@ -962,10 +966,11 @@ module MailOnRails
         "FULL" => %w[FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY].freeze
       }.freeze
 
-      METADATA_ITEMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ].freeze
+      METADATA_ITEMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ EMAILID THREADID SAVEDATE].freeze
 
       FETCH_ITEM_ATOMS = %w[UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY
-                            BODYSTRUCTURE RFC822 RFC822.HEADER RFC822.TEXT MODSEQ].freeze
+                            BODYSTRUCTURE RFC822 RFC822.HEADER RFC822.TEXT MODSEQ
+                            EMAILID THREADID SAVEDATE PREVIEW].freeze
 
       # Validates a FETCH data item: a known atom, or BODY[.PEEK][section]
       # with an optional <origin.count> partial (count mandatory and
@@ -1014,6 +1019,9 @@ module MailOnRails
         changedsince, vanished = extract_fetch_modifiers(args)
         if vanished && !(uid_mode && changedsince && @qresync)
           return tagged(tag, "BAD VANISHED requires UID FETCH with CHANGEDSINCE after ENABLE QRESYNC")
+        end
+        if (preview_error = collapse_preview_modifier(args))
+          return tagged(tag, "BAD #{preview_error}")
         end
 
         # Macros are only valid as a single bare word, never inside a
@@ -1069,6 +1077,22 @@ module MailOnRails
         [ value, group.any? { |a| a.is_a?(String) && a.casecmp?("VANISHED") } ]
       end
 
+      # Collapses "PREVIEW (LAZY)" to a plain PREVIEW item - LAZY only
+      # permits skipping generation, and we always generate (RFC 8970).
+      # Returns an error string for any other modifier.
+      def collapse_preview_modifier(args)
+        idx = args.index { |a| a.is_a?(String) && a.casecmp?("PREVIEW") }
+        return nil unless idx && args[idx + 1] == :lparen
+
+        mod = args[idx + 2]
+        unless mod.is_a?(String) && mod.casecmp?("LAZY") && args[idx + 3] == :rparen
+          return "Unknown PREVIEW modifier"
+        end
+
+        args.slice!((idx + 1)..(idx + 3))
+        nil
+      end
+
       def fetch_messages(uids, with_raw)
         return {} if uids.empty?
 
@@ -1118,6 +1142,11 @@ module MailOnRails
           when "ENVELOPE"      then out << "ENVELOPE #{Mime.envelope(parse.call)}"
           when "BODY" then out << "BODY #{Mime.bodystructure(parse.call)}"
           when "BODYSTRUCTURE" then out << "BODYSTRUCTURE #{Mime.bodystructure(parse.call, extended: true)}"
+          when "EMAILID"       then out << "EMAILID (#{msg[:email_id]})" if msg[:email_id]
+          when "THREADID"      then out << "THREADID NIL" # threading not implemented (RFC 8474 §5)
+          when "SAVEDATE"
+            out << (msg[:saved_date] ? %(SAVEDATE "#{Time.at(msg[:saved_date]).strftime("%d-%b-%Y %H:%M:%S %z")}") : "SAVEDATE NIL")
+          when "PREVIEW"       then out << "PREVIEW #{Mime.quote(Mime.preview(parse.call))}"
           when "RFC822"        then out << "RFC822 #{Mime.literal(msg[:raw])}"
           when "RFC822.HEADER" then out << "RFC822.HEADER #{Mime.literal(parse.call.header_block)}"
           when "RFC822.TEXT"   then out << "RFC822.TEXT #{Mime.literal(parse.call.body)}"
@@ -1469,6 +1498,16 @@ module MailOnRails
           raw_key { |_seq, msg| Mime.split_header(msg[:raw].to_s)[1].downcase.include?(value) }
         when "OLDER"   then age_key(toks.shift) { |age, seconds| age >= seconds }
         when "YOUNGER" then age_key(toks.shift) { |age, seconds| age <= seconds }
+        when "SAVEDBEFORE" then saved_date_key(toks.shift) { |saved, day| saved < day }
+        when "SAVEDON"     then saved_date_key(toks.shift) { |saved, day| saved == day }
+        when "SAVEDSINCE"  then saved_date_key(toks.shift) { |saved, day| saved >= day }
+        when "EMAILID"
+          value = toks.shift.to_s
+          meta_key { |_seq, msg| msg[:email_id] == value }
+        when "THREADID"
+          # Threading is not implemented: THREADID never matches (RFC 8474 §5).
+          toks.shift
+          meta_key { |_seq, _msg| false }
         when "MODSEQ"
           # Optional entry-name/entry-type prefix ("/flags/\Seen" all) is
           # accepted and ignored - flags share one modseq per message here.
@@ -1535,6 +1574,13 @@ module MailOnRails
         Date.strptime(str.to_s, "%d-%b-%Y")
       rescue ArgumentError
         raise SearchSyntaxError, "Invalid date #{str}"
+      end
+
+      # SAVEDBEFORE/SAVEDON/SAVEDSINCE (RFC 8514) compare the date the
+      # message entered the mailbox, disregarding time and timezone.
+      def saved_date_key(str, &compare)
+        day = parse_search_date(str)
+        meta_key { |_seq, msg| msg[:saved_date] && compare.call(Time.at(msg[:saved_date]).to_date, day) }
       end
 
       # RFC 5032 OLDER/YOUNGER: message age in seconds vs INTERNALDATE.

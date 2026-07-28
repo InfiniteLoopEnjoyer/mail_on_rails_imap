@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require "monitor"
 require_relative "../scram"
 
@@ -90,8 +91,9 @@ module MailOnRails
             account = @accounts.fetch(account_id) { return internal_error("unknown account") }
             return { error: "mailbox exists", code: :exists } if find_mailbox(account, name)
 
-            account[:mailboxes][name] = new_mailbox(name)
-            {}
+            mailbox = new_mailbox(name)
+            account[:mailboxes][name] = mailbox
+            { mailbox_object_id: object_id_for(mailbox) }
           end
         end
 
@@ -136,6 +138,7 @@ module MailOnRails
             {
               mailbox_id: mailbox[:id],
               name: mailbox[:name],
+              mailbox_object_id: object_id_for(mailbox),
               uid_validity: mailbox[:uid_validity],
               uid_next: mailbox[:uid_next],
               highest_modseq: mailbox[:highest_modseq],
@@ -156,7 +159,8 @@ module MailOnRails
               uid_next: mailbox[:uid_next],
               uid_validity: mailbox[:uid_validity],
               highest_modseq: mailbox[:highest_modseq],
-              size: mailbox[:messages].sum { |m| m[:size] }
+              size: mailbox[:messages].sum { |m| m[:size] },
+              mailbox_object_id: object_id_for(mailbox)
             }
           end
         end
@@ -167,7 +171,8 @@ module MailOnRails
             messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
             entries = messages.map do |m|
               entry = { uid: m[:uid], flags: m[:flags].dup, internal_date: m[:internal_date].to_i,
-                        size: m[:size], modseq: m[:modseq] }
+                        size: m[:size], modseq: m[:modseq],
+                        email_id: m[:email_id], saved_date: m[:saved_date] }
               entry[:raw] = m[:raw] if with_raw
               entry
             end
@@ -357,11 +362,26 @@ module MailOnRails
             size: normalized.bytesize,
             flags: flags,
             internal_date: internal_date,
-            modseq: next_modseq(mailbox)
+            modseq: next_modseq(mailbox),
+            # OBJECTID (RFC 8474): content-derived, so COPY/MOVE preserve
+            # it and identical APPENDs share it. SAVEDATE (RFC 8514):
+            # when the message entered *this* mailbox.
+            email_id: self.class.email_object_id(normalized),
+            saved_date: Time.now.to_i
           }
           mailbox[:uid_next] += 1
           mailbox[:messages] << message
           message
+        end
+
+        # "M<id>-<uidvalidity>": survives rename, never reused (ids are
+        # monotonic), distinct per mailbox (RFC 8474 MAILBOXID).
+        def object_id_for(mailbox)
+          "M#{mailbox[:id]}-#{mailbox[:uid_validity]}"
+        end
+
+        def self.email_object_id(raw)
+          "E#{Digest::SHA256.hexdigest(raw)[0, 24]}"
         end
 
         def internal_error(message)

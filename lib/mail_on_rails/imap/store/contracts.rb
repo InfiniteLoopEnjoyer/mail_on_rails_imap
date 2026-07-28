@@ -91,7 +91,7 @@ module MailOnRails
           end
 
           def test_list_mailboxes_is_sorted_and_grows_with_create
-            assert_empty store.create_mailbox(account_id, "Archive")
+            assert_nil store.create_mailbox(account_id, "Archive")[:error]
             names = store.list_mailboxes(account_id)[:mailboxes]
             assert_includes names, "Archive"
             assert_equal names.sort, names
@@ -242,6 +242,55 @@ module MailOnRails
             store.append(account_id, "INBOX", RAW_BARE_LF, [], nil) # normalized to CRLF size
             assert_equal 2 * RAW_CRLF.bytesize, store.status(account_id, "INBOX")[:size],
                          "STATUS=SIZE needs the summed message sizes"
+          end
+
+          # objectid grammar: 1*255(ALPHA / DIGIT / "_" / "-") (RFC 8474).
+          OBJECTID_RE = /\A[A-Za-z0-9_-]{1,255}\z/
+
+          def test_mailbox_object_ids_are_stable_and_distinct
+            created = store.create_mailbox(account_id, "Stable")[:mailbox_object_id]
+            assert_match OBJECTID_RE, created
+
+            selected = store.select_mailbox(account_id, "Stable")
+            assert_equal created, selected[:mailbox_object_id]
+            assert_equal created, store.status(account_id, "Stable")[:mailbox_object_id]
+
+            # MAILBOXID survives rename and differs between mailboxes.
+            store.rename_mailbox(account_id, "Stable", "Moved")
+            assert_equal created, store.select_mailbox(account_id, "Moved")[:mailbox_object_id]
+            refute_equal created, store.select_mailbox(account_id, "INBOX")[:mailbox_object_id]
+          end
+
+          def test_email_ids_are_content_derived_and_survive_copy_and_move
+            uid = store.append(account_id, "INBOX", RAW_CRLF, [], nil)[:uid]
+            other = store.append(account_id, "INBOX", "X: y\r\n\r\ndifferent\r\n", [], nil)[:uid]
+            mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
+
+            entries = store.fetch(mailbox_id, [ uid, other ], false)[:messages]
+            first, second = entries.map { |e| e[:email_id] }
+            assert_match OBJECTID_RE, first
+            refute_equal first, second, "different content must get different EMAILIDs"
+
+            # RFC 8474: the destination of COPY/MOVE keeps the EMAILID.
+            copied = store.copy(mailbox_id, [ uid ], "Trash")
+            trash_id = store.select_mailbox(account_id, "Trash")[:mailbox_id]
+            assert_equal first, store.fetch(trash_id, copied[:dest_uids], false)[:messages].first[:email_id]
+
+            moved = store.move(mailbox_id, [ uid ], "Archive2") if store.create_mailbox(account_id, "Archive2")
+            assert_equal first,
+                         store.fetch(store.select_mailbox(account_id, "Archive2")[:mailbox_id],
+                                     moved[:dest_uids], false)[:messages].first[:email_id]
+          end
+
+          def test_fetch_reports_saved_date
+            uid = store.append(account_id, "INBOX", RAW_CRLF, [], 1_000_000)[:uid]
+            mailbox_id = store.select_mailbox(account_id, "INBOX")[:mailbox_id]
+
+            entry = store.fetch(mailbox_id, [ uid ], false)[:messages].first
+            assert_kind_of Integer, entry[:saved_date]
+            # SAVEDATE is when the message entered the mailbox (now), not
+            # the INTERNALDATE the client supplied (1970).
+            assert_operator entry[:saved_date], :>, entry[:internal_date]
           end
 
           def test_expunge_reports_the_updated_highest_modseq
