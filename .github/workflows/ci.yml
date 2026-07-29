@@ -72,7 +72,7 @@ jobs:
       # Debian packages). ignore-unfixed skips CVEs Debian has no patch
       # for yet - failing on those would just leave CI permanently red.
       - name: Scan image for known vulnerabilities
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: mail_on_rails_imap:ci
           format: table
