@@ -7,10 +7,10 @@
 # docker build -t mail_on_rails_imap .
 # docker run -d -p 143:1143 -p 993:1993 mail_on_rails_imap
 
-# Matches the app image's Ruby (see .ruby-version there); the gemspec floor
-# is 3.4.
-ARG RUBY_VERSION=4.0.6
-FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
+# Matches the app image's Ruby (see .ruby-version); the gemspec floor is 3.4.
+# Digest-pinned so builds can't silently pick up whatever the tag points at;
+# Dependabot (docker ecosystem) PRs tag and digest bumps.
+FROM docker.io/library/ruby:4.0.6-slim@sha256:abd7528c4df35d151e2643d5efb845e442a26e36a4babc6459bee508619137a2 AS base
 
 WORKDIR /imap
 
