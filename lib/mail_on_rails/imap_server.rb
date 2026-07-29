@@ -395,7 +395,10 @@ module MailOnRails
         when "SCRAM-SHA-256" then authenticate_scram(tag, initial)
         else tagged(tag, "NO Unsupported authentication mechanism")
         end
-      rescue ArgumentError
+      rescue Imap::SessionHelpers::InvalidBase64
+        # Only base64 the *client* sent. Anything else that raises in here
+        # is ours, and belongs in the generic handler's "BAD Internal
+        # error" with a logged backtrace - not blamed on the client.
         tagged tag, "BAD Invalid base64"
       end
 
@@ -426,7 +429,7 @@ module MailOnRails
       # the password itself never travels on this path.
       def authenticate_scram(tag, initial)
         client_first = initial || (sasl_challenge(tag, "") { return } or return)
-        gs2, bare = split_scram_gs2(client_first.unpack1("m0").to_s)
+        gs2, bare = split_scram_gs2(decode_base64(client_first))
         return tagged(tag, "NO Channel binding not supported") if gs2.nil?
 
         attrs = scram_attrs(bare)
@@ -450,12 +453,14 @@ module MailOnRails
         server_first = "r=#{nonce},s=#{creds[:salt_base64]},i=#{creds[:iterations]}"
         reply = sasl_challenge(tag, [ server_first ].pack("m0")) { return } or return
 
-        client_final = reply.unpack1("m0").to_s
+        client_final = decode_base64(reply)
         final_attrs = scram_attrs(client_final)
-        proof = final_attrs["p"].to_s.unpack1("m0").to_s
+        proof = decode_base64(final_attrs["p"])
         without_proof = client_final[/\A(.*),p=[^,]*\z/m, 1].to_s
         auth_message = "#{bare},#{server_first},#{without_proof}"
 
+        # Store-supplied, so deliberately not wrapped: a verifier that
+        # won't decode is a server fault, not the client's bad base64.
         stored_key = creds[:stored_key_base64].unpack1("m0")
         unless final_attrs["r"] == nonce &&
                final_attrs["c"] == [ gs2 ].pack("m0") &&

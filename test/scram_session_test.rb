@@ -212,6 +212,60 @@ class ScramSessionTest < Minitest::Test
     assert_match(/\Aa1 BAD Invalid base64/, command(client, "a1", "AUTHENTICATE SCRAM-SHA-256 !!!not-base64!!!"))
   end
 
+  test "invalid base64 in the client final response is bad" do
+    client = session
+    begin_exchange(client, "a1")
+    client.write("!!!not-base64!!!\r\n")
+    assert_match(/\Aa1 BAD Invalid base64/, read_until_tagged(client, "a1"))
+  end
+
+  test "invalid base64 in the proof is bad" do
+    client = session
+    server_first, = begin_exchange(client, "a1")
+    nonce = server_first.split(",").find { |p| p.start_with?("r=") }[2..]
+    client.write("#{b64("c=#{b64("n,,")},r=#{nonce},p=!!!not-base64!!!")}\r\n")
+    assert_match(/\Aa1 BAD Invalid base64/, read_until_tagged(client, "a1"))
+  end
+
+  # A store that misbehaves is a server fault. It must not be reported as
+  # the client's bad base64 - a blanket ArgumentError rescue around the
+  # exchange used to do exactly that, hiding real errors behind a message
+  # blaming whoever was trying to log in.
+  class BrokenScramStore < MailOnRails::Imap::Store::Memory
+    def scram_credentials(email, ip: nil)
+      super.merge(stored_key_base64: "!!!not-base64!!!")
+    end
+  end
+
+  test "a store error is an internal error, not invalid base64" do
+    @store = BrokenScramStore.new
+    @account_id = @store.add_account(email: EMAIL, password: PASSWORD)
+
+    client = session
+    reply = authenticate(client, "a1")
+    assert_match(/\Aa1 BAD Internal error/, reply)
+    refute_match(/Invalid base64/, reply)
+  end
+
+  # Same point from the other side: an ArgumentError raised anywhere in the
+  # exchange that isn't a client base64 decode must surface as an internal
+  # error too.
+  class RaisingScramStore < MailOnRails::Imap::Store::Memory
+    def scram_credentials(email, ip: nil)
+      raise ArgumentError, "wrong number of arguments"
+    end
+  end
+
+  test "an unrelated argument error is an internal error, not invalid base64" do
+    @store = RaisingScramStore.new
+    @account_id = @store.add_account(email: EMAIL, password: PASSWORD)
+
+    client = session
+    reply = authenticate(client, "a1")
+    assert_match(/\Aa1 BAD Internal error/, reply)
+    refute_match(/Invalid base64/, reply)
+  end
+
   test "an unsupported mechanism is refused" do
     client = session
     assert_match(/\Aa1 NO Unsupported authentication mechanism/,

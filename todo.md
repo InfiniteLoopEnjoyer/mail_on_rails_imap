@@ -11,10 +11,19 @@ Running list of improvements. The original gap list (vs RIMS + net-imap,
       per-worker in the daemon) so a refresh costs one bcrypt, not five.
       TTL bounds staleness after a password change; a cached entry must never
       outlive MAX_AUTH_ATTEMPTS accounting for *failed* attempts (only cache
-      successes). NB: as of the auth throttle (2026-07-29) failures are also
-      counted app-side per ip/account — a local success cache must not let a
-      cached hit skip the throttle check for an address that has since been
-      blocked, so keep the TTL well under the block duration.
+      successes).
+
+      Interaction with the auth throttle (added 2026-07-29, counted app-side
+      per ip/account): a cache hit skips the app call, so it also skips the
+      throttle check. That is *not* a guessing hole — the cache is keyed on
+      the password, so producing a hit requires already knowing it, and the
+      throttle exists to stop people who don't. What it does mean is that a
+      block takes up to one TTL to bite a client that authenticated
+      successfully just before it. Two things follow, and both belong in the
+      implementation: never cache failures (a miss must always reach the
+      app, or the throttle stops counting), and drop the whole cache when a
+      login comes back throttled, so the first refusal converts every
+      in-flight session on that worker instead of letting them coast to TTL.
 
 - [x] **Brute-force throttle** — DONE 2026-07-29. MAX_AUTH_ATTEMPTS only ever
       bounded one connection; reconnecting reset it, so LOGIN was effectively
