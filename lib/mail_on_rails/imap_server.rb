@@ -343,6 +343,13 @@ module MailOnRails
         return tagged(tag, "NO TLS already active") if @tls
 
         tagged tag, "OK Begin TLS negotiation now"
+        # Plaintext bytes pipelined behind STARTTLS must never be executed
+        # as post-handshake commands (the CVE-2011-0411 class). They are
+        # dropped here because the new SSLSocket reads the fd directly,
+        # while anything read_line over-read sits in the old IO's buffer and
+        # dies with it. Anything that gives the session a buffered reader
+        # spanning the TLS swap reintroduces the injection - keep the
+        # pre-TLS buffer unreachable from here on.
         @socket = Imap::TLS.accept(io_for(@socket), @tls_ctx)
         @tls = true
         set_timeout(1800)
@@ -360,13 +367,27 @@ module MailOnRails
 
       def login(tag, args)
         return tagged(tag, "NO [PRIVACYREQUIRED] STARTTLS required before LOGIN") if tls_required?
+        return if reject_reauth(tag, "LOGIN")
 
         user, pass = args
         complete_login(tag, "LOGIN", user, pass)
       end
 
+      # RFC 3501 §6.2: LOGIN/AUTHENTICATE are only valid in the not-
+      # authenticated state. Beyond the letter of the spec this is an
+      # isolation guard: complete_login only replaces @account_id, so a
+      # second login would leave the *previous* account's @selected
+      # mailbox_id in place and serve its mail to the new identity.
+      def reject_reauth(tag, verb)
+        return false unless @account_id
+
+        tagged tag, "BAD #{verb} not permitted in authenticated state"
+        true
+      end
+
       def authenticate(tag, args)
         return tagged(tag, "NO [PRIVACYREQUIRED] STARTTLS required before AUTHENTICATE") if tls_required?
+        return if reject_reauth(tag, "AUTHENTICATE")
 
         mechanism, initial = args
         case mechanism.to_s.upcase
@@ -413,12 +434,16 @@ module MailOnRails
         cnonce = attrs["r"].to_s
         return tagged(tag, "BAD Malformed SCRAM message") if user.empty? || cnonce.empty?
 
-        creds = @store.scram_credentials(user)
+        creds = @store.scram_credentials(user, ip: throttle_ip)
+        return auth_throttled(tag, "AUTHENTICATE", user, creds[:retry_after]) if creds[:throttled]
+
         if creds[:error]
           # :notfound is a real credential miss (unknown account, or one
           # whose password predates SCRAM derivation); anything else is the
           # store being unreachable.
-          return creds[:code] == :notfound ? auth_failure(tag, user) : store_unavailable(tag, "AUTHENTICATE")
+          return store_unavailable(tag, "AUTHENTICATE") unless creds[:code] == :notfound
+
+          return scram_failure(tag, user)
         end
 
         nonce = cnonce + SecureRandom.alphanumeric(24)
@@ -435,7 +460,7 @@ module MailOnRails
         unless final_attrs["r"] == nonce &&
                final_attrs["c"] == [ gs2 ].pack("m0") &&
                Imap::Scram.valid_proof?(stored_key, auth_message, proof)
-          return auth_failure(tag, user)
+          return scram_failure(tag, user)
         end
 
         server_key = creds[:server_key_base64].unpack1("m0")
@@ -459,16 +484,51 @@ module MailOnRails
         message.split(",").filter_map { |part| [ part[0], part[2..] ] if part[1] == "=" }.to_h
       end
 
+      # A SCRAM attempt the daemon rejected on its own: the proof is checked
+      # here against verifier material, so the store never sees the failure
+      # and has to be told, or SCRAM would be an unthrottled way around the
+      # LOGIN throttle.
+      def scram_failure(tag, user)
+        @store.record_auth_failure(user.to_s, ip: throttle_ip)
+        auth_failure(tag, user)
+      end
+
       # Shared failed-auth accounting for LOGIN/AUTHENTICATE paths that
       # don't go through the store's password check.
       def auth_failure(tag, user)
         @auth_attempts += 1
         @store.log(:warn, "IMAP auth failed for #{user.to_s.empty? ? "(empty)" : user} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
         tagged tag, "NO [AUTHENTICATIONFAILED] Invalid credentials"
-        if @auth_attempts >= MAX_AUTH_ATTEMPTS
-          untagged "BYE Too many failed authentication attempts"
-          @logout = true
-        end
+        disconnect_if_attempts_exhausted
+      end
+
+      # The store is refusing attempts for this address or account (see the
+      # contract's throttling section). Answered with UNAVAILABLE, not
+      # AUTHENTICATIONFAILED: the credentials were never checked, and a
+      # client told its password is wrong re-prompts the user for one that
+      # is probably fine. It still burns a per-connection attempt, so a
+      # throttled client is hung up on rather than left spinning.
+      def auth_throttled(tag, verb, user, retry_after)
+        @auth_attempts += 1
+        @store.log(:warn, "IMAP #{verb} throttled for #{user.to_s.empty? ? "(empty)" : user} " \
+                          "(#{peer_ip}), #{retry_after}s remaining")
+        tagged tag, "NO [UNAVAILABLE] Too many authentication failures, try again later"
+        disconnect_if_attempts_exhausted
+      end
+
+      def disconnect_if_attempts_exhausted
+        return if @auth_attempts < MAX_AUTH_ATTEMPTS
+
+        untagged "BYE Too many failed authentication attempts"
+        @logout = true
+      end
+
+      # The address the throttle counts against. peer_ip degrades to "?"
+      # when the socket can't answer; that is a log placeholder, not an
+      # address, and must not become a throttle key of its own.
+      def throttle_ip
+        ip = peer_ip
+        ip == "?" ? nil : ip
       end
 
       # Shared LOGIN/AUTHENTICATE outcome. Failed attempts are capped like
@@ -476,11 +536,13 @@ module MailOnRails
       # so a single connection can't brute-force credentials (each attempt
       # costs a bcrypt check).
       def complete_login(tag, verb, user, pass)
-        result = @store.authenticate(user.to_s, pass.to_s)
+        result = @store.authenticate(user.to_s, pass.to_s, ip: throttle_ip)
         if result[:account_id]
           @account_id = result[:account_id]
           @store.log(:info, "IMAP login #{result[:email]} (#{peer_ip})")
           tagged tag, "OK [CAPABILITY #{capabilities}] #{verb} completed"
+        elsif result[:throttled]
+          auth_throttled(tag, verb, user, result[:retry_after])
         elsif result[:error]
           store_unavailable(tag, verb)
         else

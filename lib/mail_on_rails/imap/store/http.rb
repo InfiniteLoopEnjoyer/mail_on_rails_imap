@@ -41,12 +41,19 @@ module MailOnRails
           nil
         end
 
-        def authenticate(email, password)
-          wrap { @api.authenticate(email.to_s, password.to_s) }
+        def authenticate(email, password, ip: nil)
+          wrap { @api.authenticate(email.to_s, password.to_s, ip: ip) }
         end
 
-        def scram_credentials(email)
-          op(:scram_credentials, email: email)
+        def scram_credentials(email, ip: nil)
+          op(:scram_credentials, email: email, ip: ip)
+        end
+
+        # SCRAM proofs are checked in the daemon, so the app only learns of
+        # those failures when we report them - without this the SCRAM path
+        # would be an unthrottled way around the LOGIN throttle.
+        def record_auth_failure(email, ip: nil)
+          op(:record_auth_failure, email: email, ip: ip)
         end
 
         def list_mailboxes(account_id)

@@ -26,7 +26,8 @@ class WorkerPoolTest < Minitest::Test
     def self.from_config(_config = {}) = new
     def worker_config = { store_class: self.class }
     def log(_level, _message) = nil
-    def authenticate(_email, _password) = { account_id: nil, email: nil }
+    def authenticate(_email, _password, ip: nil) = { account_id: nil, email: nil }
+    def record_auth_failure(_email, ip: nil) = {}
   end
 
   # A one-connection server subclass, to exercise cap + release paths.

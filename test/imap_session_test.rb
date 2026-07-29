@@ -80,8 +80,9 @@ class ImapSessionTest < Minitest::Test
   # Simulates the app being unreachable: credential lookups degrade to the
   # HTTP store's error envelope instead of a credential verdict.
   class UnreachableStore < MailOnRails::Imap::Store::Memory
-    def authenticate(_email, _password) = { error: "Net::OpenTimeout", code: :internal }
-    def scram_credentials(_email) = { error: "Net::OpenTimeout", code: :internal }
+    def authenticate(_email, _password, ip: nil) = { error: "Net::OpenTimeout", code: :internal }
+    def scram_credentials(_email, ip: nil) = { error: "Net::OpenTimeout", code: :internal }
+    def record_auth_failure(_email, ip: nil) = { error: "Net::OpenTimeout", code: :internal }
   end
 
   def test_login_with_unreachable_store_is_a_temporary_failure_not_bad_credentials

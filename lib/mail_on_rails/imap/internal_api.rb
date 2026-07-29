@@ -42,10 +42,15 @@ module MailOnRails
         @pool_lock = Mutex.new
       end
 
-      # => { account_id:, email: } (both nil on bad credentials)
-      def authenticate(email, password)
-        response = post_json("authenticate", email: email, password: password)
-        { account_id: response["account_id"], email: response["email"] }
+      # => { account_id:, email: } (both nil on bad credentials), or
+      # { throttled: true, retry_after: } when the app is refusing attempts
+      # for this ip/account (see the app's AuthThrottle). +ip+ is the mail
+      # client's address, which the app counts against.
+      def authenticate(email, password, ip: nil)
+        response = post_json("authenticate", email: email, password: password, ip: ip)
+        result = { account_id: response["account_id"], email: response["email"] }
+        result.merge!(throttled: true, retry_after: response["retry_after"]) if response["throttled"]
+        result
       end
 
       # One IMAP store operation (see Store::Http); the endpoint delegates

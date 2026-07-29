@@ -62,6 +62,103 @@ module MailOnRails
             assert_nil store.log(:info, "contract check")
           end
 
+          # -- brute-force throttling ------------------------------------------
+          # A store must refuse credential checks for an address or account
+          # that has failed too often, independently of any per-connection
+          # cap the protocol server applies (that one bounds a single
+          # connection; this one bounds an attacker who reconnects). Limits
+          # and windows are the implementation's to choose, so these tests
+          # discover the limit rather than assume one.
+
+          # Fails auth until the store throttles, up to +within+ attempts.
+          # Returns the throttled result, or nil if it never throttled.
+          def fail_until_throttled(ip: "203.0.113.9", email: EMAIL, within: 60)
+            within.times do
+              result = store.authenticate(email, "definitely-not-the-password", ip: ip)
+              return result if result[:throttled]
+            end
+            nil
+          end
+
+          def test_a_single_failed_login_is_not_throttled
+            account_id
+            result = store.authenticate(EMAIL, "wrong", ip: "203.0.113.9")
+            assert_nil result[:throttled], "one failure must not throttle"
+          end
+
+          def test_repeated_failed_logins_are_throttled_with_a_retry_after
+            account_id
+            result = fail_until_throttled
+            assert result, "expected repeated failures to be throttled"
+            assert_operator result[:retry_after], :>, 0, "a throttled result must say how long to wait"
+            assert_nil result[:account_id]
+          end
+
+          # The whole point: once throttled, knowing the password is not
+          # enough. Otherwise an attacker who guesses right on attempt 500
+          # still wins.
+          def test_a_throttled_caller_is_refused_even_with_the_correct_password
+            account_id
+            assert fail_until_throttled, "expected repeated failures to be throttled"
+
+            result = store.authenticate(EMAIL, PASSWORD, ip: "203.0.113.9")
+            assert result[:throttled], "a live block must outrank correct credentials"
+            assert_nil result[:account_id]
+          end
+
+          # Salt and iteration count are all a SCRAM client gets before it
+          # proves anything, and they are enough to grind a password
+          # offline. A throttled caller must not receive them.
+          def test_scram_credentials_are_refused_while_throttled
+            account_id
+            assert fail_until_throttled, "expected repeated failures to be throttled"
+
+            result = store.scram_credentials(EMAIL, ip: "203.0.113.9")
+            assert result[:throttled], "verifier material must not be served mid-block"
+            assert_nil result[:salt_base64]
+          end
+
+          # Throttling one identity must not lock out everyone else, or the
+          # control becomes a denial-of-service tool.
+          def test_throttling_is_scoped_to_the_offending_ip_and_account
+            account_id
+            other = create_account(email: "bystander@example.test", password: PASSWORD)
+            assert other, "contract host must provision a second account"
+            assert fail_until_throttled(ip: "203.0.113.9", email: EMAIL)
+
+            result = store.authenticate("bystander@example.test", PASSWORD, ip: "198.51.100.4")
+            assert_nil result[:throttled], "an unrelated account from an unrelated ip must be unaffected"
+            assert result[:account_id]
+          end
+
+          # Failures the protocol server adjudicates itself (a bad SCRAM
+          # proof never reaches the store) still have to count, or SCRAM is
+          # an unthrottled path around the LOGIN throttle.
+          def test_record_auth_failure_counts_toward_the_throttle
+            account_id
+            60.times do
+              store.record_auth_failure(EMAIL, ip: "203.0.113.9")
+              break if store.authenticate(EMAIL, PASSWORD, ip: "203.0.113.9")[:throttled]
+            end
+
+            result = store.authenticate(EMAIL, PASSWORD, ip: "203.0.113.9")
+            assert result[:throttled], "reported failures must feed the same counter"
+          end
+
+          # A user who mistypes and then gets it right must not accumulate
+          # toward a lockout across the day.
+          def test_a_successful_login_clears_the_accounts_failure_count
+            account_id
+            3.times { store.authenticate(EMAIL, "wrong", ip: "203.0.113.9") }
+            assert store.authenticate(EMAIL, PASSWORD, ip: "203.0.113.9")[:account_id]
+
+            # The counter restarted, so the next run of failures gets a full
+            # budget rather than tripping early.
+            3.times do
+              assert_nil store.authenticate(EMAIL, "wrong", ip: "198.51.100.9")[:throttled]
+            end
+          end
+
           def test_scram_credentials_derive_from_the_account_password
             require "mail_on_rails/imap/scram"
             account_id

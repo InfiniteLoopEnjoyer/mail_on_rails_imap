@@ -11,7 +11,20 @@ Running list of improvements. The original gap list (vs RIMS + net-imap,
       per-worker in the daemon) so a refresh costs one bcrypt, not five.
       TTL bounds staleness after a password change; a cached entry must never
       outlive MAX_AUTH_ATTEMPTS accounting for *failed* attempts (only cache
-      successes).
+      successes). NB: as of the auth throttle (2026-07-29) failures are also
+      counted app-side per ip/account — a local success cache must not let a
+      cached hit skip the throttle check for an address that has since been
+      blocked, so keep the TTL well under the block duration.
+
+- [x] **Brute-force throttle** — DONE 2026-07-29. MAX_AUTH_ATTEMPTS only ever
+      bounded one connection; reconnecting reset it, so LOGIN was effectively
+      unlimited (and each attempt cost a bcrypt on a 1-vCPU host). Counters
+      now live in the app (`AuthThrottle`) because the daemon's worker Ractors
+      share no memory — a local counter would be per-worker and connections
+      are dispatched round-robin. Two scopes, per source ip and per account;
+      exim's SMTP AUTH feeds the same budget. Throttled logins answer
+      `NO [UNAVAILABLE]`, not AUTHENTICATIONFAILED, so clients keep the saved
+      password instead of prompting. See docs/store_contract.md.
 
 - [x] **Plain-HTTP internal API** — DONE 2026-07-28 (app 000d99a alias, imap
       env flip, exim followed the same day) — drop TLS on the daemon→app hop (verified

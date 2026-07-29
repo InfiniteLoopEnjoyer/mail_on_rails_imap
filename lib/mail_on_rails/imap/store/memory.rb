@@ -22,11 +22,28 @@ module MailOnRails
         # (EARLIER); beyond this the oldest are pruned and the floor rises.
         TOMBSTONE_LIMIT = 1000
 
-        def initialize(logger: nil, tombstone_limit: TOMBSTONE_LIMIT)
+        # Brute-force throttle defaults, mirroring the app's AuthThrottle
+        # (see the store contract). The production store counts in the
+        # database so every worker and both mail edges share one budget;
+        # here one process is the whole world, so a Hash is equivalent.
+        WINDOW_SECONDS = 900
+        MAX_IP_FAILURES = 20
+        MAX_ACCOUNT_FAILURES = 10
+        IP_BLOCK_SECONDS = 900
+        ACCOUNT_BLOCK_SECONDS = 300
+
+        def initialize(logger: nil, tombstone_limit: TOMBSTONE_LIMIT,
+                       window_seconds: WINDOW_SECONDS,
+                       max_ip_failures: MAX_IP_FAILURES, max_account_failures: MAX_ACCOUNT_FAILURES,
+                       ip_block_seconds: IP_BLOCK_SECONDS, account_block_seconds: ACCOUNT_BLOCK_SECONDS)
           @logger = logger
           @accounts = {} # id => { id:, email:, password:, mailboxes: { name => mailbox } }
           @counters = Hash.new(0)
           @tombstone_limit = tombstone_limit
+          @throttles = {} # [scope, key] => { count:, window_started_at:, blocked_until: }
+          @window_seconds = window_seconds
+          @limits = { "ip" => [ max_ip_failures, ip_block_seconds ],
+                      "account" => [ max_account_failures, account_block_seconds ] }
           @lock = Monitor.new
         end
 
@@ -49,19 +66,46 @@ module MailOnRails
           nil
         end
 
-        def authenticate(email, password)
+        # A throttled attempt is refused before the password is compared, so
+        # guessing costs the server nothing (see the contract's throttling
+        # section and the app's AuthThrottle for the production counters).
+        def authenticate(email, password, ip: nil)
           @lock.synchronize do
+            if (blocked = throttle_check(ip, email))
+              return blocked
+            end
+
             account = @accounts.values.find { |a| a[:email] == normalize(email) }
             account = nil unless account && !password.to_s.empty? && account[:password] == password.to_s
+            if account
+              clear_account_throttle(account[:email])
+            else
+              throttle_record(ip, email)
+            end
             { account_id: account&.dig(:id), email: account&.dig(:email) }
+          end
+        end
+
+        # Counts a failure the daemon adjudicated itself (a bad SCRAM
+        # proof), which the store would otherwise never see.
+        def record_auth_failure(email, ip: nil)
+          @lock.synchronize do
+            throttle_record(ip, email)
+            {}
           end
         end
 
         # SCRAM-SHA-256 verifier material for AUTHENTICATE (never the
         # password itself). :notfound when the account is unknown or has
-        # no derived credentials.
-        def scram_credentials(email)
+        # no derived credentials. Refused outright while throttled: the
+        # salt and iteration count are all a client gets before proving
+        # anything, and they are enough to grind offline.
+        def scram_credentials(email, ip: nil)
           @lock.synchronize do
+            if (blocked = throttle_check(ip, email))
+              return blocked
+            end
+
             account = @accounts.values.find { |a| a[:email] == normalize(email) }
             scram = account&.dig(:scram)
             return { error: "no scram credentials", code: :notfound } unless scram
@@ -300,6 +344,53 @@ module MailOnRails
         end
 
         private
+
+        # -- throttling ---------------------------------------------------------
+        # Semantics mirror the app's AuthThrottle exactly; see the store
+        # contract. Two independent scopes (source ip, account), the longer
+        # live block wins, and attempts made during a block never extend it.
+
+        def throttle_keys(ip, email)
+          keys = []
+          keys << [ "ip", ip.to_s ] unless ip.to_s.empty?
+          keys << [ "account", normalize(email) ] unless normalize(email).empty?
+          keys
+        end
+
+        def throttle_check(ip, email, now: Time.now)
+          live = throttle_keys(ip, email).filter_map do |key|
+            entry = @throttles[key]
+            entry if entry && entry[:blocked_until] && entry[:blocked_until] > now
+          end
+          return nil if live.empty?
+
+          longest = live.max_by { |e| e[:blocked_until] }
+          { account_id: nil, email: nil, throttled: true,
+            retry_after: (longest[:blocked_until] - now).ceil }
+        end
+
+        def throttle_record(ip, email, now: Time.now)
+          throttle_keys(ip, email).each do |key|
+            limit, block_seconds = @limits.fetch(key.first)
+            entry = @throttles[key] ||= { count: 0, window_started_at: now, blocked_until: nil }
+            next if entry[:blocked_until] && entry[:blocked_until] > now
+
+            # A lapsed block (or an expired window) starts a fresh budget,
+            # so serving a block doesn't leave the counter at the limit.
+            if entry[:blocked_until] || entry[:window_started_at] < now - @window_seconds
+              entry.merge!(count: 0, window_started_at: now, blocked_until: nil)
+            end
+            entry[:count] += 1
+            entry[:blocked_until] = now + block_seconds if entry[:count] >= limit
+          end
+          nil
+        end
+
+        # A successful login clears the account's counter; the ip counter
+        # stays, so one lucky guess doesn't reset an attacker's budget.
+        def clear_account_throttle(email)
+          @throttles.delete([ "account", normalize(email) ])
+        end
 
         def normalize(email)
           email.to_s.strip.downcase
