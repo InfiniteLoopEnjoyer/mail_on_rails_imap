@@ -25,4 +25,10 @@ Gem::Specification.new do |spec|
   # standalone container has nothing else pulling it, so bin/server used to
   # crash-loop on boot.
   spec.add_dependency "logger"
+
+  # The json default gem shipped with ruby 4.0.6 (2.18.0) carries
+  # CVE-2026-33210, and bin/server's bundler/setup pins `require "json"`
+  # (internal_api.rb) to whatever the lock resolves - so the fixed floor
+  # has to be declared here for the daemon to actually load a safe version.
+  spec.add_dependency "json", ">= 2.19.2"
 end

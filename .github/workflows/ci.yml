@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  # Advisories land between pushes; a daily re-scan catches new CVEs in the
+  # bundle and the container image even when the repo is quiet. Lint and
+  # tests are skipped on the scheduled runs - only the scans repeat.
+  schedule:
+    - cron: "41 5 * * *"
+
+jobs:
+  scan_ruby:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Scan for known security vulnerabilities in gems used
+        run: bundle exec bundler-audit check --update
+
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Lint code for consistent style
+        run: bundle exec rubocop -f github
+
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Run tests
+        run: bin/test
+
+  scan_image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Build production image
+        run: docker build -t mail_on_rails_imap:ci .
+
+      # bundler-audit sees the gems; this sees the OS layer (ruby:slim's
+      # Debian packages). ignore-unfixed skips CVEs Debian has no patch
+      # for yet - failing on those would just leave CI permanently red.
+      - name: Scan image for known vulnerabilities
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: mail_on_rails_imap:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH

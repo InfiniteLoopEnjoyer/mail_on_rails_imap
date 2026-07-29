@@ -1,0 +1,19 @@
+# Keep the image to runtime files only - and keep local TLS material and
+# secrets out of the build context entirely (Trivy's secret scan in CI
+# fails the build if a private key sneaks into a layer).
+/.git/
+/.gitignore
+/.github/
+/.bundle/
+/.env
+
+# Self-signed dev TLS material (the daemon regenerates it on demand).
+/storage/
+
+# Real production infrastructure config (never in the image; Kamal reads
+# it from the checkout).
+/config/deploy.prod.yml
+
+/tmp/
+/docs/
+/test/
