@@ -69,7 +69,7 @@ module MailOnRails
         # A throttled attempt is refused before the password is compared, so
         # guessing costs the server nothing (see the contract's throttling
         # section and the app's AuthThrottle for the production counters).
-        def authenticate(email, password, ip: nil)
+        def authenticate(email, password, ip: nil, source: nil)
           @lock.synchronize do
             if (blocked = throttle_check(ip, email))
               return blocked
@@ -88,7 +88,7 @@ module MailOnRails
 
         # Counts a failure the daemon adjudicated itself (a bad SCRAM
         # proof), which the store would otherwise never see.
-        def record_auth_failure(email, ip: nil)
+        def record_auth_failure(email, ip: nil, source: nil)
           @lock.synchronize do
             throttle_record(ip, email)
             {}

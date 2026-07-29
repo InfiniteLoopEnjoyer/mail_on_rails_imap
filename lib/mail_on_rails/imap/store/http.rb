@@ -17,6 +17,9 @@ module MailOnRails
       # failure (see Store::Contracts). One HTTP round-trip per store
       # call - chatty for IMAP, accepted for the isolation.
       class Http
+        # Names this edge in the app's attempt log (AuthAttempt).
+        SOURCE = "imap"
+
         def initialize(api: nil, logger: Logger.new($stdout))
           @logger = logger
           @api = api || InternalApi.new
@@ -41,8 +44,8 @@ module MailOnRails
           nil
         end
 
-        def authenticate(email, password, ip: nil)
-          wrap { @api.authenticate(email.to_s, password.to_s, ip: ip) }
+        def authenticate(email, password, ip: nil, source: SOURCE)
+          wrap { @api.authenticate(email.to_s, password.to_s, ip: ip, source: source) }
         end
 
         def scram_credentials(email, ip: nil)
@@ -52,8 +55,8 @@ module MailOnRails
         # SCRAM proofs are checked in the daemon, so the app only learns of
         # those failures when we report them - without this the SCRAM path
         # would be an unthrottled way around the LOGIN throttle.
-        def record_auth_failure(email, ip: nil)
-          op(:record_auth_failure, email: email, ip: ip)
+        def record_auth_failure(email, ip: nil, source: SOURCE)
+          op(:record_auth_failure, email: email, ip: ip, source: source)
         end
 
         def list_mailboxes(account_id)

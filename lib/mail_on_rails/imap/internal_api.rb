@@ -46,8 +46,8 @@ module MailOnRails
       # { throttled: true, retry_after: } when the app is refusing attempts
       # for this ip/account (see the app's AuthThrottle). +ip+ is the mail
       # client's address, which the app counts against.
-      def authenticate(email, password, ip: nil)
-        response = post_json("authenticate", email: email, password: password, ip: ip)
+      def authenticate(email, password, ip: nil, source: nil)
+        response = post_json("authenticate", email: email, password: password, ip: ip, source: source)
         result = { account_id: response["account_id"], email: response["email"] }
         result.merge!(throttled: true, retry_after: response["retry_after"]) if response["throttled"]
         result
