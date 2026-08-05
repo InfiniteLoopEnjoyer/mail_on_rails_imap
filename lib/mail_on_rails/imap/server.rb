@@ -3,6 +3,7 @@
 require "socket"
 require "etc"
 require_relative "conn_limiter"
+require_relative "denylist"
 require_relative "tls"
 require_relative "worker"
 
@@ -52,6 +53,7 @@ module MailOnRails
         @listeners = listeners
         @tls_material = tls_material
         @limiter = ConnLimiter.new(self.class::MAX_CONNECTIONS)
+        @denylist = Denylist.new(ENV["MAIL_ON_RAILS_IMAP_DENYLIST_FILE"])
         @worker_count = [ workers || Integer(ENV.fetch("MAIL_ON_RAILS_IMAP_WORKERS") { Etc.nprocessors }), 1 ].max
         @dispatchers = []
         @round_robin = 0
@@ -136,6 +138,14 @@ module MailOnRails
         server = spec[:tcp_server] || TCPServer.new(spec[:host], spec[:port])
         loop do
           socket = server.accept
+          # Admin-banned addresses (the Rails app's BannedIp) get a bare
+          # close before any greeting or limiter slot - a banned scanner
+          # earns silence, not a banner. No release needed: nothing was
+          # acquired.
+          if @denylist.banned?(peer_ip(socket))
+            close_quietly(socket)
+            next
+          end
           tune_keepalive(socket)
           if @limiter.acquire
             dispatch(socket, session_spec, spec_index)
@@ -182,6 +192,20 @@ module MailOnRails
 
       def reject_busy(socket)
         socket.write("#{busy_line}\r\n")
+        socket.close
+      rescue StandardError
+        nil
+      end
+
+      # nil rather than "?" on failure so an address we couldn't read can
+      # never match a denylist entry (same care as Session#throttle_ip).
+      def peer_ip(socket)
+        socket.remote_address.ip_address
+      rescue StandardError
+        nil
+      end
+
+      def close_quietly(socket)
         socket.close
       rescue StandardError
         nil

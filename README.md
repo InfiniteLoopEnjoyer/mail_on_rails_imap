@@ -77,6 +77,7 @@ arbitrary binary survives JSON.
 | `MAIL_ON_RAILS_IMAP_MAX_LINE` | `65536` | Command-line length cap |
 | `MAIL_ON_RAILS_IMAP_WORKERS` | CPU cores | Session worker count |
 | `MAIL_ON_RAILS_IMAP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
+| `MAIL_ON_RAILS_IMAP_DENYLIST_FILE` | - | Rails-managed `banned_ips` file (one IP/CIDR per line, shared mailconf volume). Matching peers are closed before the greeting; mtime is polled (~5s), so bans land live. Unset ⇒ no denylist |
 
 ## Test / run
 

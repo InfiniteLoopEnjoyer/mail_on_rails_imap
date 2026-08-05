@@ -59,6 +59,13 @@ env:
     MAIL_ON_RAILS_TLS_CERT: /etc/letsencrypt/live/mail.example.com/fullchain.pem
     MAIL_ON_RAILS_TLS_KEY: /etc/letsencrypt/live/mail.example.com/privkey.pem
 
+    # Permanent IP/CIDR bans, written by the Rails app on the shared
+    # mailconf volume (one per line; the same file exim's connect ACL
+    # reads). Matching connections are closed before the greeting; the
+    # file's mtime is polled, so bans land within seconds - no restart.
+    # Unset ⇒ no denylist (dev default).
+    MAIL_ON_RAILS_IMAP_DENYLIST_FILE: /var/lib/mail_on_rails/dynamic/banned_ips
+
 aliases:
   logs: app logs -f
   shell: app exec --interactive --reuse "bash"
@@ -67,6 +74,9 @@ volumes:
   # Mounted at the letsencrypt root (not live/) because live/*.pem are
   # symlinks into ../../archive/.
   - "/etc/letsencrypt:/etc/letsencrypt:ro"
+  # The mailconf volume the Rails app and exim share; this daemon only
+  # reads banned_ips off it (MAIL_ON_RAILS_IMAP_DENYLIST_FILE above).
+  - "mail_on_rails_mailconf:/var/lib/mail_on_rails/dynamic:ro"
 
 builder:
   arch: amd64
