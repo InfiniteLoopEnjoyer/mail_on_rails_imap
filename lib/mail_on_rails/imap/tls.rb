@@ -101,6 +101,9 @@ module MailOnRails
         chain = OpenSSL::X509::Certificate.load(material[:cert])
         ctx.add_certificate(chain.first, OpenSSL::PKey.read(material[:key]), chain.drop(1))
         ctx.min_version = OpenSSL::SSL::TLS1_2_VERSION
+        # TLS 1.2 AEAD-only (no CBC, silences LUCKY13); TLS 1.3 suites are
+        # AEAD by construction and unaffected by this list.
+        ctx.ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20"
         # We never verify client certs; clients verify us (or accept self-signed).
         ctx.verify_mode = OpenSSL::SSL::VERIFY_NONE
         ctx.session_id_context = "mail_on_rails"
