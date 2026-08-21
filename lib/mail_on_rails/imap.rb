@@ -24,7 +24,7 @@ module MailOnRails
       module_function
 
       def start(logger:, tls_dir:)
-        store = Store::WithSource.new(Store::ImapBackend.new, "imap")
+        store = MailOnRails::Store::WithSource.new(MailOnRails::Store::ImapBackend.new, "imap")
         Daemon.start(store: store, logger: logger, tls_dir: tls_dir)
       end
 
