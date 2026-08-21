@@ -1,0 +1,608 @@
+# frozen_string_literal: true
+
+require "digest"
+require "monitor"
+require "mail_on_rails/scram"
+require_relative "../mime"
+
+module MailOnRails
+  module Imap
+    module Store
+      # In-memory reference implementation of the IMAP side of the store
+      # contract (docs/store_contract.md in the main mail_on_rails app repo),
+      # with no Rails or database dependency. It exists so protocol behavior
+      # can be tested without an app or a database, and it doubles as the
+      # executable answer to "what must a store do". Not for production:
+      # everything lives (unencrypted, unbounded) in one process's memory.
+      #
+      # Beyond the contract it exposes one test seam: +add_account+ to
+      # provision credentials.
+      class Memory
+        DEFAULT_MAILBOXES = %w[INBOX Sent Drafts Trash Junk].freeze
+        # Expunge tombstones kept per mailbox for QRESYNC's VANISHED
+        # (EARLIER); beyond this the oldest are pruned and the floor rises.
+        TOMBSTONE_LIMIT = 1000
+
+        # Brute-force throttle defaults, mirroring the app's AuthThrottle
+        # (see the store contract). The production store counts in the
+        # database so every worker and both mail edges share one budget;
+        # here one process is the whole world, so a Hash is equivalent.
+        WINDOW_SECONDS = 900
+        MAX_IP_FAILURES = 20
+        MAX_ACCOUNT_FAILURES = 10
+        IP_BLOCK_SECONDS = 900
+        ACCOUNT_BLOCK_SECONDS = 300
+
+        def initialize(logger: nil, tombstone_limit: TOMBSTONE_LIMIT,
+                       window_seconds: WINDOW_SECONDS,
+                       max_ip_failures: MAX_IP_FAILURES, max_account_failures: MAX_ACCOUNT_FAILURES,
+                       ip_block_seconds: IP_BLOCK_SECONDS, account_block_seconds: ACCOUNT_BLOCK_SECONDS)
+          @logger = logger
+          @accounts = {} # id => { id:, email:, password:, mailboxes: { name => mailbox } }
+          @counters = Hash.new(0)
+          @tombstone_limit = tombstone_limit
+          @throttles = {} # [scope, key] => { count:, window_started_at:, blocked_until: }
+          @window_seconds = window_seconds
+          @limits = { "ip" => [ max_ip_failures, ip_block_seconds ],
+                      "account" => [ max_account_failures, account_block_seconds ] }
+          @banned_cidrs = []
+          @honeypot_events = []
+          # Keys the SCRAM decoy material; one random secret per store
+          # instance is enough - determinism only has to hold within a
+          # process (the app store derives its own from secret_key_base).
+          @decoy_secret = OpenSSL::Random.random_bytes(32)
+          @lock = Monitor.new
+        end
+
+        attr_reader :honeypot_events
+
+        # -- test seams (not part of the contract) -----------------------------
+
+        # Adds an entry to the accept-side denylist (Netserv::Denylist
+        # polls banned_cidrs); empty by default, so bans are opt-in per test.
+        def ban_ip(cidr)
+          @lock.synchronize { @banned_cidrs << cidr }
+        end
+
+        def add_account(email:, password:, honeypot: false)
+          @lock.synchronize do
+            account = { id: next_id(:account), email: normalize(email), password: password.to_s,
+                        honeypot: honeypot,
+                        scram: Scram.derive(password.to_s), quota_bytes: nil, mailboxes: {} }
+            DEFAULT_MAILBOXES.each { |name| account[:mailboxes][name] = new_mailbox(name) }
+            @accounts[account[:id]] = account
+            account[:id]
+          end
+        end
+
+        # Test seam: cap the account's storage (nil = unlimited).
+        def set_quota(account_id, bytes)
+          @lock.synchronize { @accounts.fetch(account_id)[:quota_bytes] = bytes }
+        end
+
+        # -- shared interface ---------------------------------------------------
+
+        def log(level, message)
+          @logger&.public_send(level, "[mail_on_rails] #{message}")
+          nil
+        end
+
+        def banned_cidrs
+          @lock.synchronize { @banned_cidrs.dup }
+        end
+
+        # A throttled attempt is refused before the password is compared, so
+        # guessing costs the server nothing (see the contract's throttling
+        # section and the app's AuthThrottle for the production counters).
+        def authenticate(email, password, ip: nil, source: nil)
+          @lock.synchronize do
+            if (blocked = throttle_check(ip, email))
+              return blocked
+            end
+
+            account = @accounts.values.find { |a| a[:email] == normalize(email) }
+            account = nil unless account && !password.to_s.empty? && account[:password] == password.to_s
+            if account
+              clear_account_throttle(account[:email])
+            else
+              throttle_record(ip, email)
+            end
+            { account_id: account&.dig(:id), email: account&.dig(:email), honeypot: account&.dig(:honeypot) || false }
+          end
+        end
+
+        # -- honeypot interface (optional store methods) ------------------------
+
+        def record_honeypot_event(info)
+          @lock.synchronize do
+            id = next_id(:honeypot)
+            @honeypot_events << info.to_h.merge(id: id)
+            { id: id }
+          end
+        end
+
+        def update_honeypot_transcript(id, transcript:)
+          @lock.synchronize do
+            event = @honeypot_events.find { |e| e[:id] == id }
+            event[:transcript] = transcript if event
+            {}
+          end
+        end
+
+        # Counts a failure the daemon adjudicated itself (a bad SCRAM
+        # proof), which the store would otherwise never see.
+        def record_auth_failure(email, ip: nil, source: nil)
+          @lock.synchronize do
+            throttle_record(ip, email)
+            {}
+          end
+        end
+
+        # SCRAM-SHA-256 verifier material for AUTHENTICATE (never the
+        # password itself). An unknown or not-yet-derived account gets
+        # deterministic decoy material instead of a miss, so the exchange
+        # can't be used as a username oracle (the proof never verifies).
+        # Refused outright while throttled: the salt and iteration count
+        # are all a client gets before proving anything, and they are
+        # enough to grind offline.
+        def scram_credentials(email, ip: nil)
+          @lock.synchronize do
+            if (blocked = throttle_check(ip, email))
+              return blocked
+            end
+
+            account = @accounts.values.find { |a| a[:email] == normalize(email) }
+            scram = account&.dig(:scram)
+            return Scram.decoy_credentials(normalize(email), @decoy_secret) unless scram
+
+            {
+              account_id: account[:id],
+              email: account[:email],
+              salt_base64: [ scram[:salt] ].pack("m0"),
+              iterations: scram[:iterations],
+              stored_key_base64: [ scram[:stored_key] ].pack("m0"),
+              server_key_base64: [ scram[:server_key] ].pack("m0"),
+              honeypot: account[:honeypot] || false
+            }
+          end
+        end
+
+        # -- IMAP interface -----------------------------------------------------
+
+        def list_mailboxes(account_id)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            { mailboxes: account[:mailboxes].keys.sort }
+          end
+        end
+
+        def create_mailbox(account_id, name)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            return { error: "mailbox exists", code: :exists } if find_mailbox(account, name)
+
+            mailbox = new_mailbox(name)
+            account[:mailboxes][name] = mailbox
+            { mailbox_object_id: object_id_for(mailbox) }
+          end
+        end
+
+        def delete_mailbox(account_id, name)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            mailbox = find_mailbox(account, name)
+            return { error: "no such mailbox", code: :notfound } unless mailbox
+
+            account[:mailboxes].delete(mailbox[:name])
+            {}
+          end
+        end
+
+        # Renames the mailbox and everything under it in the "/" hierarchy.
+        def rename_mailbox(account_id, from, to)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            mailbox = find_mailbox(account, from)
+            return { error: "no such mailbox", code: :notfound } unless mailbox
+            return { error: "mailbox exists", code: :exists } if find_mailbox(account, to)
+
+            from_name = mailbox[:name]
+            prefix = "#{from_name}/"
+            account[:mailboxes].keys
+                   .select { |n| n == from_name || n.start_with?(prefix) }
+                   .each do |old_name|
+              moved = account[:mailboxes].delete(old_name)
+              moved[:name] = to + old_name[from_name.length..]
+              account[:mailboxes][moved[:name]] = moved
+            end
+            {}
+          end
+        end
+
+        def select_mailbox(account_id, name)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            mailbox = find_mailbox(account, name)
+            return { error: "no such mailbox", code: :notfound } unless mailbox
+
+            {
+              mailbox_id: mailbox[:id],
+              name: mailbox[:name],
+              mailbox_object_id: object_id_for(mailbox),
+              uid_validity: mailbox[:uid_validity],
+              uid_next: mailbox[:uid_next],
+              highest_modseq: mailbox[:highest_modseq],
+              messages: sorted(mailbox).map { |m| [ m[:uid], m[:flags].dup, m[:modseq] ] }
+            }
+          end
+        end
+
+        def status(account_id, name)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            mailbox = find_mailbox(account, name)
+            return { error: "no such mailbox", code: :notfound } unless mailbox
+
+            {
+              messages: mailbox[:messages].size,
+              unseen: mailbox[:messages].count { |m| !m[:flags].include?("\\Seen") },
+              uid_next: mailbox[:uid_next],
+              uid_validity: mailbox[:uid_validity],
+              highest_modseq: mailbox[:highest_modseq],
+              size: mailbox[:messages].sum { |m| m[:size] },
+              mailbox_object_id: object_id_for(mailbox)
+            }
+          end
+        end
+
+        def fetch(mailbox_id, uids, with_raw)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
+            entries = messages.map do |m|
+              entry = { uid: m[:uid], flags: m[:flags].dup, internal_date: m[:internal_date].to_i,
+                        size: m[:size], modseq: m[:modseq],
+                        email_id: m[:email_id], thread_id: m[:thread_id], saved_date: m[:saved_date] }
+              entry[:raw] = m[:raw] if with_raw
+              entry
+            end
+            { messages: entries }
+          end
+        end
+
+        def store_flags(mailbox_id, uids, mode, flags)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
+            updated = messages.map do |m|
+              # Flags are case-insensitive atoms: adding "Custom1" to a
+              # message flagged "custom1" is a no-op, and removing it
+              # matches regardless of case (first-seen spelling is kept).
+              new_flags =
+                case mode
+                when "+" then m[:flags] + flags.reject { |f| m[:flags].any? { |e| e.casecmp?(f) } }
+                when "-" then m[:flags].reject { |e| flags.any? { |f| e.casecmp?(f) } }
+                else flags.dup
+                end
+              # A store that changes nothing gets no new modseq: clients
+              # would otherwise re-sync messages whose state is identical.
+              if new_flags.sort != m[:flags].sort
+                m[:flags] = new_flags
+                m[:modseq] = next_modseq(mailbox)
+              end
+              [ m[:uid], m[:flags].dup, m[:modseq] ]
+            end
+            { messages: updated }
+          end
+        end
+
+        # uids: nil removes every \Deleted message; a list restricts removal
+        # to \Deleted messages with those UIDs (UID EXPUNGE).
+        def expunge(mailbox_id, uids = nil)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            return { uids: [] } unless mailbox
+
+            doomed, kept = mailbox[:messages].partition do |m|
+              m[:flags].include?("\\Deleted") && (uids.nil? || uids.include?(m[:uid]))
+            end
+            mailbox[:messages] = kept
+            removed = doomed.map { |m| m[:uid] }.sort
+            add_tombstones(mailbox, removed)
+            { uids: removed, highest_modseq: mailbox[:highest_modseq] }
+          end
+        end
+
+        def append(account_id, mailbox_name, raw, flags, internal_date_epoch)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            mailbox = find_mailbox(account, mailbox_name)
+            return { error: "no such mailbox", code: :notfound } unless mailbox
+
+            incoming = raw.gsub(/(?<!\r)\n/, "\r\n").bytesize
+            if over_quota?(account, incoming)
+              return { error: "#{account[:email]} is over its storage quota", code: :overquota }
+            end
+
+            internal_date = internal_date_epoch ? Time.at(internal_date_epoch) : Time.now
+            message = deliver_raw(account, mailbox, raw, flags: Array(flags), internal_date: internal_date)
+            { uid: message[:uid], uid_validity: mailbox[:uid_validity] }
+          end
+        end
+
+        def copy(mailbox_id, uids, dest_name)
+          @lock.synchronize do
+            source = mailbox_by_id(mailbox_id)
+            return internal_error("unknown mailbox") unless source
+
+            account = @accounts.values.find { |a| a[:mailboxes].value?(source) }
+            dest = find_mailbox(account, dest_name)
+            return { error: "no such mailbox", code: :notfound } unless dest
+
+            wanted = sorted(source).select { |m| uids.include?(m[:uid]) }
+            if over_quota?(account, wanted.sum { |m| m[:size] })
+              return { error: "#{account[:email]} is over its storage quota", code: :overquota }
+            end
+
+            src_uids = []
+            dest_uids = []
+            wanted.each do |m|
+              copied = deliver_raw(account, dest, m[:raw], flags: m[:flags].dup, internal_date: m[:internal_date])
+              src_uids << m[:uid]
+              dest_uids << copied[:uid]
+            end
+            { uid_validity: dest[:uid_validity], src_uids: src_uids, dest_uids: dest_uids }
+          end
+        end
+
+        # QRESYNC: uids expunged after since_modseq. complete: false means
+        # tombstone history was pruned past since_modseq, so the answer
+        # falls back to every uid ever allocated but no longer present
+        # (uids are never reused, so that set is correct, just larger).
+        def expunged_since(mailbox_id, since_modseq)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            return { uids: [], complete: true } unless mailbox
+
+            if since_modseq >= mailbox[:tombstone_floor]
+              uids = mailbox[:tombstones].filter_map { |uid, modseq| uid if modseq > since_modseq }
+              { uids: uids.sort.uniq, complete: true }
+            else
+              present = mailbox[:messages].map { |m| m[:uid] }
+              { uids: (1...mailbox[:uid_next]).to_a - present, complete: false }
+            end
+          end
+        end
+
+        # GETQUOTA/GETQUOTAROOT (RFC 2087/9208): usage is the live sum of
+        # message sizes across the account's mailboxes; limit nil = no
+        # quota. Moves stay exempt from enforcement (same-account,
+        # net-zero) - only append and copy check.
+        def quota(account_id)
+          @lock.synchronize do
+            account = @accounts.fetch(account_id) { return internal_error("unknown account") }
+            { used_bytes: used_bytes(account), limit_bytes: account[:quota_bytes] }
+          end
+        end
+
+        # TEXT/BODY search pushdown (see the store contract). The contract
+        # only promises whole-word, case-insensitive matching - the
+        # production store searches an index that tokenizes by word - but
+        # this reference implementation keeps the exact RFC 3501 semantics
+        # (case-insensitive substring over the raw message, or over its
+        # body section for scope "body"), so protocol tests running against
+        # it observe a fully conformant SEARCH.
+        def search_text(mailbox_id, query, scope)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            return { uids: [] } unless mailbox
+
+            needle = query.to_s.downcase
+            hits = sorted(mailbox).select do |m|
+              haystack = scope.to_s == "body" ? Imap::Mime.split_header(m[:raw])[1] : m[:raw]
+              haystack.downcase.include?(needle)
+            end
+            { uids: hits.map { |m| m[:uid] } }
+          end
+        end
+
+        # Atomic copy+remove (RFC 6851 MOVE): the message never exists in
+        # both mailboxes from an observer's point of view.
+        def move(mailbox_id, uids, dest_name)
+          @lock.synchronize do
+            source = mailbox_by_id(mailbox_id)
+            return internal_error("unknown mailbox") unless source
+
+            account = @accounts.values.find { |a| a[:mailboxes].value?(source) }
+            dest = find_mailbox(account, dest_name)
+            return { error: "no such mailbox", code: :notfound } unless dest
+
+            src_uids = []
+            dest_uids = []
+            moved = sorted(source).select { |m| uids.include?(m[:uid]) }
+            moved.each do |m|
+              copied = deliver_raw(account, dest, m[:raw], flags: m[:flags].dup, internal_date: m[:internal_date])
+              src_uids << m[:uid]
+              dest_uids << copied[:uid]
+            end
+            source[:messages] = source[:messages].reject { |m| src_uids.include?(m[:uid]) }
+            add_tombstones(source, src_uids)
+            { uid_validity: dest[:uid_validity], src_uids: src_uids, dest_uids: dest_uids }
+          end
+        end
+
+        private
+
+        # -- throttling ---------------------------------------------------------
+        # Semantics mirror the app's AuthThrottle exactly; see the store
+        # contract. Two independent scopes (source ip, account), the longer
+        # live block wins, and attempts made during a block never extend it.
+
+        def throttle_keys(ip, email)
+          keys = []
+          keys << [ "ip", ip.to_s ] unless ip.to_s.empty?
+          keys << [ "account", normalize(email) ] unless normalize(email).empty?
+          keys
+        end
+
+        def throttle_check(ip, email, now: Time.now)
+          live = throttle_keys(ip, email).filter_map do |key|
+            entry = @throttles[key]
+            entry if entry && entry[:blocked_until] && entry[:blocked_until] > now
+          end
+          return nil if live.empty?
+
+          longest = live.max_by { |e| e[:blocked_until] }
+          { account_id: nil, email: nil, throttled: true,
+            retry_after: (longest[:blocked_until] - now).ceil }
+        end
+
+        def throttle_record(ip, email, now: Time.now)
+          throttle_keys(ip, email).each do |key|
+            limit, block_seconds = @limits.fetch(key.first)
+            entry = @throttles[key] ||= { count: 0, window_started_at: now, blocked_until: nil }
+            next if entry[:blocked_until] && entry[:blocked_until] > now
+
+            # A lapsed block (or an expired window) starts a fresh budget,
+            # so serving a block doesn't leave the counter at the limit.
+            if entry[:blocked_until] || entry[:window_started_at] < now - @window_seconds
+              entry.merge!(count: 0, window_started_at: now, blocked_until: nil)
+            end
+            entry[:count] += 1
+            entry[:blocked_until] = now + block_seconds if entry[:count] >= limit
+          end
+          nil
+        end
+
+        # A successful login clears the account's counter; the ip counter
+        # stays, so one lucky guess doesn't reset an attacker's budget.
+        def clear_account_throttle(email)
+          @throttles.delete([ "account", normalize(email) ])
+        end
+
+        def normalize(email)
+          email.to_s.strip.downcase
+        end
+
+        def used_bytes(account)
+          account[:mailboxes].each_value.sum { |m| m[:messages].sum { |msg| msg[:size] } }
+        end
+
+        def over_quota?(account, incoming_bytes)
+          (limit = account[:quota_bytes]) && used_bytes(account) + incoming_bytes > limit
+        end
+
+        def next_id(kind)
+          @counters[kind] += 1
+        end
+
+        def new_mailbox(name)
+          { id: next_id(:mailbox), name: name, uid_validity: Time.now.to_i, uid_next: 1,
+            highest_modseq: 1, messages: [], tombstones: [], tombstone_floor: 0 }
+        end
+
+        # Records [uid, modseq] for an expunged message, pruning history
+        # beyond the limit; the floor remembers the highest pruned modseq
+        # so expunged_since can tell precise answers from truncated ones.
+        def add_tombstones(mailbox, uids)
+          return if uids.empty?
+
+          modseq = next_modseq(mailbox)
+          uids.each { |uid| mailbox[:tombstones] << [ uid, modseq ] }
+          overflow = mailbox[:tombstones].length - @tombstone_limit
+          if overflow.positive?
+            pruned = mailbox[:tombstones].shift(overflow)
+            mailbox[:tombstone_floor] = [ mailbox[:tombstone_floor], pruned.map(&:last).max ].max
+          end
+          modseq
+        end
+
+        # Every mutation of a mailbox's contents gets the next per-mailbox
+        # mod-sequence (RFC 7162 CONDSTORE).
+        def next_modseq(mailbox)
+          mailbox[:highest_modseq] += 1
+        end
+
+        # INBOX is matched case-insensitively (RFC 3501); other names exactly.
+        def find_mailbox(account, name)
+          return account[:mailboxes].values.find { |m| m[:name].casecmp?("INBOX") } if name.to_s.casecmp?("INBOX")
+
+          account[:mailboxes][name]
+        end
+
+        def mailbox_by_id(mailbox_id)
+          @accounts.each_value do |account|
+            account[:mailboxes].each_value { |m| return m if m[:id] == mailbox_id }
+          end
+          nil
+        end
+
+        def sorted(mailbox)
+          mailbox[:messages].sort_by { |m| m[:uid] }
+        end
+
+        def deliver_raw(account, mailbox, raw, flags:, internal_date:)
+          normalized = raw.gsub(/(?<!\r)\n/, "\r\n")
+          email_id = self.class.email_object_id(normalized)
+          headers = Imap::Mime.parse_headers(Imap::Mime.split_header(normalized)[0])
+          message_id = message_ids(headers["message-id"]).first
+          message = {
+            uid: mailbox[:uid_next],
+            raw: normalized,
+            size: normalized.bytesize,
+            flags: flags,
+            internal_date: internal_date,
+            modseq: next_modseq(mailbox),
+            # OBJECTID (RFC 8474): content-derived, so COPY/MOVE preserve
+            # it and identical APPENDs share it. SAVEDATE (RFC 8514):
+            # when the message entered *this* mailbox.
+            email_id: email_id,
+            message_id: message_id,
+            thread_id: resolve_thread_id(account, message_ids(headers["references"]),
+                                         message_ids(headers["in-reply-to"]).first, message_id, email_id),
+            saved_date: Time.now.to_i
+          }
+          mailbox[:uid_next] += 1
+          mailbox[:messages] << message
+          message
+        end
+
+        # Bare msg-ids out of a Message-Id/References/In-Reply-To header.
+        def message_ids(values)
+          values.to_a.flat_map { |v| v.scan(/<([^>]+)>/) }.flatten
+        end
+
+        # THREADID resolution, mirroring the app adapter (see the store
+        # contract): a reply adopts the thread of any ancestor stored in
+        # the account; otherwise the id derives deterministically from the
+        # chain's root reference / the message's own id / its content
+        # hash, so a thread converges even when messages arrive out of
+        # order.
+        def resolve_thread_id(account, references, in_reply_to, message_id, fallback)
+          ancestors = (references + [ in_reply_to ]).compact.uniq
+          if ancestors.any?
+            parent = account[:mailboxes].each_value.flat_map { |m| m[:messages] }
+                                        .find { |m| m[:thread_id] && ancestors.include?(m[:message_id]) }
+            return parent[:thread_id] if parent
+          end
+
+          "T#{Digest::SHA256.hexdigest(ancestors.first || message_id || fallback)[0, 24]}"
+        end
+
+        # "M<id>-<uidvalidity>": survives rename, never reused (ids are
+        # monotonic), distinct per mailbox (RFC 8474 MAILBOXID).
+        def object_id_for(mailbox)
+          "M#{mailbox[:id]}-#{mailbox[:uid_validity]}"
+        end
+
+        def self.email_object_id(raw)
+          "E#{Digest::SHA256.hexdigest(raw)[0, 24]}"
+        end
+
+        def internal_error(message)
+          { error: message, code: :internal }
+        end
+      end
+    end
+  end
+end

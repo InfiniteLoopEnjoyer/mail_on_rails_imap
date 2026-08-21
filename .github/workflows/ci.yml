@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: "23 2 * * *" # nightly deep fuzz
+
+jobs:
+  # RuboCop lives in lint.yml and bundler-audit in security.yml - separate
+  # workflows so each gets its own README status badge.
+
+  wire-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+
+      - name: IMAP wire/session suite (Rails-free)
+        run: bundle exec rake test:wire
+
+  # The Active Record store backend against the store contract, on SQLite
+  # (the core gem's CI runs the full adapter matrix for the models).
+  db-suite:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+
+      - name: Store suite
+        run: bundle exec rake test:db
+
+  # PR-time coverage is a small smoke; the nightly schedule carries the
+  # deep run the smoke can't afford. The seed is the workflow run id so a
+  # red night is replayable from the log line alone: FUZZ_SEED=<run id>.
+  fuzz:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+
+      - name: Fuzz smoke
+        run: bundle exec ruby -Ilib lib/mail_on_rails/fuzz/imap_runner.rb
+        env:
+          FUZZ_ROUNDS: "25"
+
+  fuzz_deep:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+
+      - name: Deep fuzz
+        run: bundle exec ruby -Ilib lib/mail_on_rails/fuzz/imap_runner.rb
+        env:
+          FUZZ_ROUNDS: "5000"
+          FUZZ_SEED: ${{ github.run_id }}
