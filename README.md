@@ -70,6 +70,19 @@ Unset, development serves every installed protocol and other environments
 serve none in-process (run `bin/mail_server`). `config.mail_on_rails.protocols`
 is the initializer equivalent.
 
+**Solid Queue is required** for anything beyond serving the tables. A
+`bin/mail_server` process runs no job worker; the core gem's
+maintenance (`prune!` of history/throttles/transcripts, DKIM rotation,
+report sending) and the jobs IMAP sessions enqueue (honeypot and IP
+enrichment) are Active Jobs driven by the host's recurring schedule -
+the reference is
+[mail_on_rails_admin](https://github.com/InfiniteLoopEnjoyer/mail_on_rails_admin)'s
+`config/recurring.yml` on a Solid Queue supervisor against the same
+database. If the same deployment also accepts mail (the SMTP gem), the
+worker is what routes and delivers it - see that gem's README. A
+standalone mode that runs Solid Queue inside `bin/mail_server` is on the
+todo list.
+
 ## Configuration
 
 Everything is a setting in the core gem's schema (`MailOnRails::Settings`,
