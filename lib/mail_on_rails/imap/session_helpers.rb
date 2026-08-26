@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "mail_on_rails/netserv/ip"
+
 module MailOnRails
   module Imap
     # Transport helpers shared by the SMTP and IMAP session classes. Both keep
@@ -39,8 +41,10 @@ module MailOnRails
       end
 
       # Remote IP for log lines; memoized because STARTTLS swaps @socket.
+      # Canonicalized like the server's accept-time address (v4-mapped
+      # peers off a dual-stack socket read as plain IPv4).
       def peer_ip
-        @peer_ip ||= io_for(@socket).remote_address.ip_address
+        @peer_ip ||= Netserv.canonical_ip(io_for(@socket).remote_address.ip_address)
       rescue StandardError
         "?"
       end
