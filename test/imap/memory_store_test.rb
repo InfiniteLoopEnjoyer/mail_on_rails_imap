@@ -38,11 +38,28 @@ class MemoryImapStoreTest < Minitest::Test
 
     result = store.expunged_since(mailbox_id, 0)
     refute result[:complete], "history before the floor cannot be answered precisely"
-    assert_equal uids.sort, result[:uids].sort, "fallback must cover every missing uid"
+    assert_nil result[:uids], "the fallback is reported as gaps, never a uid list sized by uid_next"
+    assert_equal [ [ uids.first, uids.last ] ], result[:ranges], "fallback must cover every missing uid"
 
     recent = store.expunged_since(mailbox_id, store.status(account, "INBOX")[:highest_modseq] - 1)
     assert recent[:complete]
     assert_equal [ uids[2] ], recent[:uids]
+  end
+
+  # M10: the fallback set is computed as gaps in one pass over the present
+  # uids - a mailbox whose uid_next is in the billions costs nothing
+  # extra, and the gaps are exact.
+  def test_missing_uid_ranges_streams_gaps_without_materializing_the_range
+    ranges = MailOnRails::Imap::Store
+    assert_equal [], ranges.missing_uid_ranges([ 1, 2, 3 ], 4)
+    assert_equal [ [ 1, 3 ] ], ranges.missing_uid_ranges([], 4)
+    assert_equal [ [ 1, 4 ], [ 6, 9 ], [ 11, 2**31 - 1 ] ], ranges.missing_uid_ranges([ 5, 10 ], 2**31)
+    assert_equal [ [ 2, 2 ] ], ranges.missing_uid_ranges([ 1, 3 ], 4)
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    huge = ranges.missing_uid_ranges((1..1000).map { |i| i * 3 }, 2**40)
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.5
+    assert_equal 1001, huge.length
   end
 
   # -- honeypot seams ---------------------------------------------------------

@@ -45,6 +45,53 @@ module MailOnRails
     # being a StandardError - would escape the command handler and kill the
     # session thread. A legitimate search nests only a few levels.
     MAX_SEARCH_DEPTH = 64
+    # A sequence set is resolved as sorted, merged intervals against the
+    # snapshot; the parse itself is linear in the chunk count, so cap it -
+    # no client sends hundreds of disjoint ranges, and a set that long is
+    # an attempt to make every cover-check cost the mailbox size.
+    MAX_SEQUENCE_CHUNKS = 512
+    # Message-Id ancestry kept per message for THREAD=REFERENCES. RFC 5322
+    # §3.6.4 lets an agent trim a References field; keeping the oldest and
+    # newest ids preserves the root and the immediate parent, and bounds
+    # the placeholder chain a crafted header can build.
+    MAX_THREAD_REFERENCES = 64
+    # SORT/THREAD base-subject extraction works on a prefix of the Subject:
+    # a re:/fwd: chain longer than this carries no more threading signal,
+    # and the strip must stay linear in the subject size.
+    MAX_BASE_SUBJECT_BYTES = 1024
+    # Mailbox names and hierarchy depth (M11): after UTF-7 decoding a name
+    # could otherwise be as long as a literal, and CREATE a/b/c/... makes
+    # every intermediate mailbox.
+    MAX_MAILBOX_NAME_BYTES = 1024
+    MAX_MAILBOX_DEPTH = 20
+    # LIST/LSUB pattern bounds, checked before the Regexp is compiled:
+    # Regexp.timeout does not cover compile time, and a pattern of a
+    # million "%" costs seconds there alone.
+    MAX_LIST_PATTERN_BYTES = 1024
+    MAX_LIST_WILDCARDS = 16
+    # Keyword flags are atoms (RFC 3501 §9): 7-bit printable, none of the
+    # atom-specials, and short; they are echoed in FETCH responses.
+    MAX_KEYWORD_BYTES = 255
+    MAX_KEYWORDS = 128
+    # Store calls per command are bounded: metadata for up to
+    # FETCH_META_BATCH messages at a time, raw bytes for at most
+    # FETCH_RAW_BATCH messages or FETCH_RAW_BATCH_BYTES per call (sizes come
+    # from the metadata pass, so a batch never holds more than that plus
+    # one message). Responses stream out per batch, in mailbox order.
+    FETCH_META_BATCH = 500
+    FETCH_RAW_BATCH = 50
+    FETCH_RAW_BATCH_BYTES = 32 * 1024 * 1024
+    # Raw work one SEARCH/SORT/THREAD may do for keys the store can't
+    # answer (HEADER <field>, CC/BCC, SENT*, punctuation-only TEXT): past
+    # either bound the command fails with NO [LIMIT] rather than parsing
+    # the whole mailbox.
+    MAX_SEARCH_RAW_MESSAGES = 10_000
+    MAX_SEARCH_RAW_BYTES = 256 * 1024 * 1024
+    # Inactivity allowed before authentication. The configured session
+    # timeout is sized for authenticated clients (IDLE reissues every ~29
+    # min); a peer that has connected but not logged in gets far less, so
+    # a connection flood can't park sockets for half an hour each.
+    PREAUTH_TIMEOUT = 120
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
     # APPENDLIMIT=<n> (RFC 7889) advertises one upload limit for every
     # mailbox - the same cap the literal reader enforces.
@@ -298,9 +345,18 @@ module MailOnRails
       end
 
       # Overridable via spec so tests can exercise the timeout close
-      # reason without waiting out a real client's half hour.
+      # reason without waiting out a real client's half hour. Short until
+      # the session authenticates (PREAUTH_TIMEOUT), the configured value
+      # after; re-applied by the login paths and by STARTTLS.
       def session_timeout
-        @spec[:timeout] || 1800
+        full = @spec[:timeout] || 1800
+        return full if @account_id
+
+        [ @spec[:preauth_timeout] || PREAUTH_TIMEOUT, full ].min
+      end
+
+      def handshake_timeout
+        @spec[:handshake_timeout] || Netserv::Server::HANDSHAKE_TIMEOUT
       end
 
       # -- transport ---------------------------------------------------------
@@ -454,10 +510,12 @@ module MailOnRails
       # keeps its mechanism but drops any initial response. Everything else is
       # recorded verbatim - it is the intel.
       def redact_imap(line)
+        # Leading whitespace is tolerated by the lexer, so it must not be a
+        # way past the redaction.
         case line
-        when /\A(\S+)\s+(LOGIN)\b/i
+        when /\A\s*(\S+)\s+(LOGIN)\b/i
           "#{Regexp.last_match(1)} #{Regexp.last_match(2).upcase} [redacted]"
-        when /\A(\S+)\s+(AUTHENTICATE)\s+(\S+)(.*)/i
+        when /\A\s*(\S+)\s+(AUTHENTICATE)\s+(\S+)(.*)/i
           rest = Regexp.last_match(4).to_s.strip.empty? ? "" : " [redacted]"
           "#{Regexp.last_match(1)} #{Regexp.last_match(2).upcase} #{Regexp.last_match(3)}#{rest}"
         else
@@ -500,7 +558,13 @@ module MailOnRails
         # Transport failures (including the over-length-line abort) are
         # session-fatal; only command-level errors get a BAD.
         raise
-      rescue StandardError => e
+      rescue SequenceSetError => e
+        @protocol_errors += 1
+        tagged tag || "*", "BAD #{e.message}"
+      rescue StandardError, SystemStackError => e
+        # SystemStackError is not a StandardError: without naming it here a
+        # handler recursing on hostile input (see MAX_SEARCH_DEPTH) would
+        # escape to run's rescue and end the session instead of the command.
         @store.log(:error, "IMAP command error: #{e.class}: #{e.message} #{e.backtrace&.first}")
         tagged tag || "*", "BAD Internal error"
       end
@@ -597,6 +661,12 @@ module MailOnRails
         # dies with it. Anything that gives the session a buffered reader
         # spanning the TLS swap reintroduces the injection - keep the
         # pre-TLS buffer unreachable from here on.
+        #
+        # The handshake runs under the accept-side HANDSHAKE_TIMEOUT (the
+        # implicit-TLS listener's bound), not the session's: a peer that
+        # sends STARTTLS and then nothing must not hold the thread for the
+        # inactivity timeout.
+        set_timeout(handshake_timeout)
         @socket = Netserv::Tls.accept(io_for(@socket), @tls_ctx)
         @tls = true
         set_timeout(session_timeout)
@@ -770,8 +840,7 @@ module MailOnRails
         empty = sasl_challenge(tag, [ verifier ].pack("m0")) { return } or return
         return tagged(tag, "BAD Unexpected final client response") unless empty.empty?
 
-        @account_id = creds[:account_id]
-        @username = creds[:email]
+        authenticated(creds[:account_id], creds[:email])
         @store.log(:info, "IMAP login #{creds[:email]} (#{peer_ip}, SCRAM#{"-PLUS" if plus})")
         honeypot_login! if creds[:honeypot]
         tagged tag, "OK [CAPABILITY #{capabilities}] AUTHENTICATE completed"
@@ -860,8 +929,7 @@ module MailOnRails
 
         result = @store.authenticate(user.to_s, pass.to_s, ip: throttle_ip)
         if result[:account_id]
-          @account_id = result[:account_id]
-          @username = result[:email]
+          authenticated(result[:account_id], result[:email])
           @store.log(:info, "IMAP login #{result[:email]} (#{peer_ip})")
           # A login against a canary can only be an attacker: record it and ban
           # the source, but let them in so we observe what they FETCH/SEARCH.
@@ -874,6 +942,14 @@ module MailOnRails
         else
           auth_failure(tag, user)
         end
+      end
+
+      # The session is now someone's: the pre-auth inactivity bound gives
+      # way to the configured one.
+      def authenticated(account_id, email)
+        @account_id = account_id
+        @username = email
+        set_timeout(session_timeout)
       end
 
       # A store error during authentication means the app is unreachable,
@@ -952,13 +1028,18 @@ module MailOnRails
         if pattern.empty?
           untagged %(#{verb} (\\Noselect) "/" "")
         else
-          regex = wildcard_regex(Imap::Utf7.decode(ref.to_s + pattern))
+          full = ref.to_s + pattern
+          return tagged(tag, "BAD #{verb} pattern too long") if full.bytesize > MAX_LIST_PATTERN_BYTES
+          return tagged(tag, "BAD #{verb} pattern has too many wildcards") if full.count("*%") > MAX_LIST_WILDCARDS
+
+          regex = wildcard_regex(Imap::Utf7.decode(full))
           names = mailbox_names
+          parents = parent_names(names)
           names.each do |name|
             next unless name.match?(regex)
             next if special_only && !SPECIAL_USE.key?(name)
 
-            untagged %(#{verb} (#{list_attributes(name, names)}) "/" #{Imap::Mime.quote(Imap::Utf7.encode(name))})
+            untagged %(#{verb} (#{list_attributes(name, parents)}) "/" #{Imap::Mime.quote(Imap::Utf7.encode(name))})
             emit_status(name, status_items) if status_items
           end
         end
@@ -999,10 +1080,20 @@ module MailOnRails
         items
       end
 
-      def list_attributes(name, names)
-        attrs = [ names.any? { |n| n.start_with?("#{name}/") } ? "\\HasChildren" : "\\HasNoChildren" ]
+      # parents: the Set every listed name's parent (see parent_names), so
+      # the CHILDREN attribute is one lookup per line rather than a scan of
+      # the whole mailbox list per line.
+      def list_attributes(name, parents)
+        attrs = [ parents.include?(name) ? "\\HasChildren" : "\\HasNoChildren" ]
         attrs << SPECIAL_USE[name] if SPECIAL_USE.key?(name)
         attrs.join(" ")
+      end
+
+      def parent_names(names)
+        names.each_with_object(Set.new) do |name, parents|
+          idx = name.rindex("/")
+          parents << name[0...idx] if idx
+        end
       end
 
       def mailbox_names
@@ -1031,7 +1122,7 @@ module MailOnRails
         create_missing_parents(name)
         result = @store.create_mailbox(@account_id, name)
         if result[:error]
-          tagged tag, "NO #{result[:code] == :exists ? "[ALREADYEXISTS] " : ""}CREATE failed: #{result[:error]}"
+          store_failure(tag, "CREATE", result, exists: "[ALREADYEXISTS] ")
         else
           # RFC 8474: the new mailbox's object id rides the tagged OK.
           code = result[:mailbox_object_id] ? "[MAILBOXID (#{result[:mailbox_object_id]})] " : ""
@@ -1059,6 +1150,13 @@ module MailOnRails
           tagged tag, "BAD Mailbox name must be 7-bit (modified UTF-7)"
           return nil
         end
+        # Sized before decoding as well: modified UTF-7 never shrinks by
+        # more than half, so an encoded name past twice the cap can't
+        # decode to a legal one and needn't be decoded at all.
+        if arg.to_s.bytesize > MAX_MAILBOX_NAME_BYTES * 2
+          tagged tag, "NO [CANNOT] #{command} failed: mailbox name too long"
+          return nil
+        end
 
         name = Imap::Utf7.decode(arg.to_s)
         if name.empty?
@@ -1069,7 +1167,32 @@ module MailOnRails
           tagged tag, error.start_with?("BAD") ? error : "NO #{command} failed: #{error}"
           return nil
         end
+        if name.bytesize > MAX_MAILBOX_NAME_BYTES
+          tagged tag, "NO [CANNOT] #{command} failed: mailbox name too long"
+          return nil
+        end
+        if name.count("/") >= MAX_MAILBOX_DEPTH
+          tagged tag, "NO [CANNOT] #{command} failed: mailbox hierarchy too deep"
+          return nil
+        end
         name
+      end
+
+      # Store errors reach the client only as the fixed RFC 5530 codes and
+      # the store's own short reason for the codes it defines. Anything
+      # else (:internal - an exception inside the store, whose text names
+      # adapters, tables and SQL) is logged here with the command context
+      # and answered with a fixed temporary failure.
+      KNOWN_STORE_CODES = %i[notfound exists overquota infected unavailable].freeze
+
+      def store_failure(tag, verb, result, codes = {})
+        unless KNOWN_STORE_CODES.include?(result[:code])
+          @store.log(:error, "IMAP #{verb} failed in the store (#{peer_ip}): #{result[:error]}")
+          return tagged(tag, "NO [UNAVAILABLE] #{verb} failed: temporary server error")
+        end
+
+        code = codes.fetch(result[:code]) { error_response_code(result) }
+        tagged tag, "NO #{code}#{verb} failed: #{result[:error]}"
       end
 
       # RFC 3501 §6.3.3/§6.3.5: a name with hierarchy separators SHOULD
@@ -1090,7 +1213,7 @@ module MailOnRails
 
         result = @store.delete_mailbox(@account_id, name)
         if result[:error]
-          tagged tag, "NO #{result[:code] == :notfound ? "[NONEXISTENT] " : ""}DELETE failed: #{result[:error]}"
+          store_failure(tag, "DELETE", result, notfound: "[NONEXISTENT] ")
         else
           tagged tag, "OK DELETE completed"
         end
@@ -1104,8 +1227,7 @@ module MailOnRails
         create_missing_parents(to)
         result = @store.rename_mailbox(@account_id, from, to)
         if result[:error]
-          code = { exists: "[ALREADYEXISTS] ", notfound: "[NONEXISTENT] " }[result[:code]] || ""
-          tagged tag, "NO #{code}RENAME failed: #{result[:error]}"
+          store_failure(tag, "RENAME", result, exists: "[ALREADYEXISTS] ", notfound: "[NONEXISTENT] ")
         else
           # The selected mailbox keeps its id across a rename; only the
           # name (used by resync) needs updating.
@@ -1127,7 +1249,7 @@ module MailOnRails
 
         create_missing_parents(to)
         result = @store.create_mailbox(@account_id, to)
-        return tagged(tag, "NO [ALREADYEXISTS] RENAME failed: #{result[:error]}") if result[:error]
+        return store_failure(tag, "RENAME", result, exists: "[ALREADYEXISTS] ") if result[:error]
 
         inbox = @store.select_mailbox(@account_id, "INBOX")
         uids = inbox[:messages].map(&:first)
@@ -1276,13 +1398,13 @@ module MailOnRails
         return unless qresync[:uid_validity] == result[:uid_validity]
 
         known = qresync[:known_uids] && parse_ranges(qresync[:known_uids], result[:uid_next] - 1)
-        vanished = @store.expunged_since(@selected[:mailbox_id], qresync[:modseq])[:uids] || []
-        vanished = vanished.select { |uid| known.any? { |r| r.cover?(uid) } } if known
-        untagged "VANISHED (EARLIER) #{compress_set(vanished)}" if vanished.any?
+        vanished = vanished_ranges(@store.expunged_since(@selected[:mailbox_id], qresync[:modseq]))
+        vanished = intersect_ranges(vanished, known) if known
+        untagged "VANISHED (EARLIER) #{ranges_to_set(vanished)}" if vanished.any?
 
         @uids.each_with_index do |uid, idx|
           next unless (@modseqs[uid] || 1) > qresync[:modseq]
-          next if known && known.none? { |r| r.cover?(uid) }
+          next if known && !ranges_cover?(known, uid)
 
           untagged "#{idx + 1} FETCH (UID #{uid} FLAGS (#{@flags[uid].join(" ")}) MODSEQ (#{@modseqs[uid]}))"
         end
@@ -1354,8 +1476,9 @@ module MailOnRails
         if @qresync
           untagged "VANISHED #{compress_set(removed)}"
         else
+          gone = removed.to_set
           @uids.each_with_index.to_a.reverse_each do |uid, idx|
-            untagged "#{idx + 1} EXPUNGE" if removed.include?(uid)
+            untagged "#{idx + 1} EXPUNGE" if gone.include?(uid)
           end
         end
         removed.each { |uid| @flags.delete(uid); @modseqs.delete(uid) }
@@ -1364,32 +1487,97 @@ module MailOnRails
 
       # -- message sets --------------------------------------------------------
 
-      # Resolves an IMAP sequence set against the current mailbox snapshot.
-      # Returns [[seq, uid], ...] in mailbox order.
+      # A sequence set the server refuses to resolve (too many ranges); the
+      # message becomes the tagged BAD.
+      class SequenceSetError < StandardError; end
+
+      # Parses an IMAP sequence set into ascending, disjoint Ranges ("*"
+      # reads as +max+), so that resolving one costs the number of ranges
+      # times a binary search - never ranges times mailbox size.
       def parse_ranges(set, max)
-        set.to_s.split(",").filter_map do |chunk|
+        chunks = set.to_s.split(",")
+        raise SequenceSetError, "Sequence set has too many ranges" if chunks.length > MAX_SEQUENCE_CHUNKS
+
+        ranges = chunks.map do |chunk|
           lo, hi = chunk.split(":", 2)
           lo = lo == "*" ? max : lo.to_i
           hi = hi.nil? ? lo : (hi == "*" ? max : hi.to_i)
           lo, hi = hi, lo if lo > hi
           (lo..hi)
         end
+        merge_ranges(ranges)
       end
 
+      # Sorts and coalesces overlapping/adjacent ranges.
+      def merge_ranges(ranges)
+        merged = []
+        ranges.sort_by(&:begin).each do |r|
+          last = merged.last
+          if last && r.begin <= last.end + 1
+            merged[-1] = (last.begin..r.end) if r.end > last.end
+          else
+            merged << r
+          end
+        end
+        merged
+      end
+
+      # Ranges from an expunged_since result: precise answers list uids,
+      # the tombstone-floor fallback lists [lo, hi] gaps (so a mailbox
+      # with a large uid_next never materializes every missing uid).
+      def vanished_ranges(result)
+        return result[:ranges].map { |lo, hi| (lo..hi) } if result[:ranges]
+
+        merge_ranges((result[:uids] || []).map { |uid| (uid..uid) })
+      end
+
+      # Intersection of two ascending, disjoint range lists.
+      def intersect_ranges(a, b)
+        out = []
+        i = j = 0
+        while i < a.length && j < b.length
+          lo = [ a[i].begin, b[j].begin ].max
+          hi = [ a[i].end, b[j].end ].min
+          out << (lo..hi) if lo <= hi
+          a[i].end < b[j].end ? i += 1 : j += 1
+        end
+        out
+      end
+
+      def ranges_cover?(ranges, value)
+        r = ranges.bsearch { |range| range.end >= value }
+        !r.nil? && r.begin <= value
+      end
+
+      def ranges_to_set(ranges)
+        ranges.map { |r| r.begin == r.end ? r.begin.to_s : "#{r.begin}:#{r.end}" }.join(",")
+      end
+
+      # Resolves a sequence set against the snapshot: [[seq, uid], ...] in
+      # mailbox order, each message once.
       def resolve_set(set, uid_mode)
         return [] if @uids.empty?
 
         # "$" is the whole sequence set (RFC 5182); expunged messages
         # drop out naturally because only current uids resolve.
         if set == "$"
-          return @uids.each_with_index.filter_map { |uid, idx| [ idx + 1, uid ] if @saved_search.include?(uid) }
+          saved = @saved_search.to_set
+          return @uids.each_with_index.filter_map { |uid, idx| [ idx + 1, uid ] if saved.include?(uid) }
         end
 
         ranges = parse_ranges(set, uid_mode ? @uids.last : @uids.length)
         result = []
-        @uids.each_with_index do |uid, idx|
-          value = uid_mode ? uid : idx + 1
-          result << [ idx + 1, uid ] if ranges.any? { |r| r.cover?(value) }
+        ranges.each do |r|
+          if uid_mode
+            # @uids is ascending: find the first uid in range, walk to the end.
+            idx = @uids.bsearch_index { |uid| uid >= r.begin } or next
+            while idx < @uids.length && @uids[idx] <= r.end
+              result << [ idx + 1, @uids[idx] ]
+              idx += 1
+            end
+          else
+            ([ r.begin, 1 ].max..[ r.end, @uids.length ].min).each { |seq| result << [ seq, @uids[seq - 1] ] }
+          end
         end
         result
       end
@@ -1484,21 +1672,20 @@ module MailOnRails
         items << "MODSEQ" if @condstore && items.none? { |i| i.casecmp?("MODSEQ") }
 
         if vanished
-          gone = @store.expunged_since(@selected[:mailbox_id], changedsince)[:uids] || []
-          ranges = parse_ranges(set, @uids.last || 0)
-          gone = gone.select { |uid| ranges.any? { |r| r.cover?(uid) } }
-          untagged "VANISHED (EARLIER) #{compress_set(gone)}" if gone.any?
+          gone = vanished_ranges(@store.expunged_since(@selected[:mailbox_id], changedsince))
+          gone = intersect_ranges(gone, parse_ranges(set, @uids.last || 0))
+          untagged "VANISHED (EARLIER) #{ranges_to_set(gone)}" if gone.any?
         end
 
         wanted = resolve_set(set, uid_mode)
         wanted = wanted.select { |_seq, uid| (@modseqs[uid] || 1) > changedsince } if changedsince
         need_raw = items.any? { |i| !METADATA_ITEMS.include?(i.upcase) }
-        messages = fetch_messages(wanted.map(&:last), need_raw)
-        newly_seen = mark_fetched_seen(items, wanted.filter_map { |_seq, uid| messages[uid] })
-
-        wanted.each do |seq, uid|
-          msg = messages[uid] or next
-          untagged "#{seq} FETCH (#{fetch_items(msg, items, announce_seen: newly_seen.include?(uid)).join(" ")})"
+        each_fetched(wanted, need_raw) do |batch, messages|
+          newly_seen = mark_fetched_seen(items, batch.filter_map { |_seq, uid| messages[uid] })
+          batch.each do |seq, uid|
+            msg = messages[uid] or next
+            untagged "#{seq} FETCH (#{fetch_items(msg, items, announce_seen: newly_seen.include?(uid)).join(" ")})"
+          end
         end
         tagged tag, "OK FETCH completed"
       end
@@ -1541,6 +1728,51 @@ module MailOnRails
 
         result = @store.fetch(@selected[:mailbox_id], uids, with_raw)
         (result[:messages] || []).to_h { |m| [ m[:uid], m ] }
+      end
+
+      # Raised when a SEARCH/SORT/THREAD would parse more raw mail than
+      # MAX_SEARCH_RAW_* allow; answered NO [LIMIT] (RFC 5530).
+      class SearchLimitError < StandardError; end
+
+      # Fetches +pairs+ ([seq, uid] in mailbox order) from the store in
+      # bounded batches (see FETCH_META_BATCH / FETCH_RAW_BATCH*), yielding
+      # each batch with its uid => message hash so the caller can answer as
+      # it goes. Raw batches are sized from the metadata pass. A budget
+      # ({ messages:, bytes: }, mutated) caps the raw work in total.
+      def each_fetched(pairs, need_raw, budget: nil)
+        pairs.each_slice(FETCH_META_BATCH) do |slice|
+          messages = fetch_messages(slice.map(&:last), false)
+          next yield(slice, messages) unless need_raw
+
+          raw_batches(slice, messages, budget).each do |batch|
+            yield batch, fetch_messages(batch.map(&:last), true)
+          end
+        end
+      end
+
+      def raw_batches(slice, messages, budget)
+        batches = []
+        bytes = 0
+        slice.each do |seq, uid|
+          size = messages[uid]&.dig(:size) or next
+
+          if budget
+            budget[:messages] -= 1
+            budget[:bytes] -= size
+            raise SearchLimitError, "Search too expensive, narrow the criteria" if budget[:messages].negative? || budget[:bytes].negative?
+          end
+          if batches.empty? || batches.last.length >= FETCH_RAW_BATCH || bytes + size > FETCH_RAW_BATCH_BYTES
+            batches << []
+            bytes = 0
+          end
+          batches.last << [ seq, uid ]
+          bytes += size
+        end
+        batches
+      end
+
+      def search_raw_budget
+        { messages: MAX_SEARCH_RAW_MESSAGES, bytes: MAX_SEARCH_RAW_BYTES }
       end
 
       # RFC 3501: RFC822, RFC822.TEXT and BODY[...] (without .PEEK)
@@ -1628,12 +1860,23 @@ module MailOnRails
 
       # Canonicalizes system-flag spellings and dedupes case-insensitively
       # (flags are atoms). Returns nil if the list names a "\" flag the
-      # server doesn't define - clients cannot invent system flags.
+      # server doesn't define - clients cannot invent system flags - or a
+      # keyword that isn't an atom: flags may arrive as literals, so any
+      # byte can show up here, and they are echoed in FETCH responses.
       def parse_flag_list(raw)
+        return nil if raw.length > MAX_KEYWORDS
+
         flags = raw.map { |f| CANONICAL_FLAGS.fetch(f.downcase, f) }
-        return nil if flags.any? { |f| f.start_with?("\\") && !CANONICAL_FLAGS.value?(f) }
+        return nil unless flags.all? { |f| CANONICAL_FLAGS.value?(f) || valid_keyword?(f) }
 
         flags.uniq(&:downcase)
+      end
+
+      # RFC 3501 atom minus the flag-extension backslash: 7-bit printable,
+      # none of ( ) { % * " \ ] or control bytes, non-empty and short.
+      def valid_keyword?(flag)
+        flag.bytesize.between?(1, MAX_KEYWORD_BYTES) && flag.ascii_only? &&
+          flag.match?(/\A[\x21-\x7e]+\z/) && !flag.match?(/[(){%*"\\\]]/)
       end
 
       def store(tag, args, uid_mode)
@@ -1661,7 +1904,7 @@ module MailOnRails
         return tagged(tag, "BAD STORE expects a flag list") if args.none? { |a| a == :lparen || a.is_a?(String) }
 
         flags = parse_flag_list(args.select { |a| a.is_a?(String) })
-        return tagged(tag, "BAD Unknown system flag") if flags.nil?
+        return tagged(tag, "BAD Invalid flag list") if flags.nil?
 
         flags = flags.reject { |f| f == "\\Recent" }
 
@@ -1713,7 +1956,7 @@ module MailOnRails
 
         result = @store.copy(@selected[:mailbox_id], wanted.map(&:last), dest_name)
         if result[:error]
-          tagged tag, "NO #{error_response_code(result)}COPY failed: #{result[:error]}"
+          store_failure(tag, "COPY", result)
         else
           copyuid = "#{result[:uid_validity]} #{result[:src_uids].join(",")} #{result[:dest_uids].join(",")}"
           tagged tag, "OK [COPYUID #{copyuid}] COPY completed"
@@ -1733,9 +1976,7 @@ module MailOnRails
         return tagged(tag, "OK MOVE completed (nothing to move)") if wanted.empty?
 
         result = @store.move(@selected[:mailbox_id], wanted.map(&:last), dest_name)
-        if result[:error]
-          return tagged(tag, "NO #{error_response_code(result)}MOVE failed: #{result[:error]}")
-        end
+        return store_failure(tag, "MOVE", result) if result[:error]
 
         # RFC 6851: COPYUID rides an untagged OK and precedes the EXPUNGEs.
         untagged "OK [COPYUID #{result[:uid_validity]} #{result[:src_uids].join(",")} #{result[:dest_uids].join(",")}]"
@@ -1752,12 +1993,17 @@ module MailOnRails
       # Raised for malformed search criteria; the message becomes the BAD text.
       class SearchSyntaxError < StandardError; end
 
-      # A compiled search key: raw marks keys that need message bytes
-      # (header/body content), so SEARCH can filter on metadata first and
-      # fetch raw bytes only for the messages that survive.
-      SearchKey = Struct.new(:raw, :fn) do
+      # A compiled search key with the cheapest data it can be answered
+      # from: the session snapshot alone (uid, seq, flags, modseq, and
+      # store-pushed-down content), store metadata (size, dates, ids), or
+      # the raw message bytes. search_hits filters level by level so a
+      # narrow key never makes the store ship the whole mailbox.
+      LEVEL_SNAPSHOT = 0
+      LEVEL_META = 1
+      LEVEL_RAW = 2
+
+      SearchKey = Struct.new(:level, :fn) do
         def call(seq, msg) = fn.call(seq, msg)
-        def raw? = raw
       end
 
       ESEARCH_OPTIONS = %w[MIN MAX COUNT ALL SAVE].freeze
@@ -1795,6 +2041,8 @@ module MailOnRails
         tagged tag, "OK SEARCH completed"
       rescue SearchSyntaxError => e
         tagged tag, "BAD #{e.message}"
+      rescue SearchLimitError => e
+        tagged tag, "NO [LIMIT] #{e.message}"
       end
 
       SORT_KEYS = %w[ARRIVAL CC DATE FROM SIZE SUBJECT TO].freeze
@@ -1816,9 +2064,11 @@ module MailOnRails
         @search_modseq = false
         hits = search_hits(args, uid_mode)
         need_raw = criteria.any? { |key, _rev| RAW_SORT_KEYS.include?(key) }
-        messages = fetch_messages(hits.map(&:last), need_raw)
-
-        keyed = hits.map { |seq, uid| [ seq, uid, sort_values(messages[uid], criteria) ] }
+        # Sort values are extracted per batch; raw bytes never accumulate.
+        keyed = []
+        each_fetched(hits, need_raw, budget: need_raw ? search_raw_budget : nil) do |batch, messages|
+          batch.each { |seq, uid| (msg = messages[uid]) && keyed << [ seq, uid, sort_values(msg, criteria) ] }
+        end
         sorted = keyed.sort do |a, b|
           order = 0
           criteria.each_with_index do |(_key, reverse), i|
@@ -1834,6 +2084,8 @@ module MailOnRails
         tagged tag, "OK SORT completed"
       rescue SearchSyntaxError => e
         tagged tag, "BAD #{e.message}"
+      rescue SearchLimitError => e
+        tagged tag, "NO [LIMIT] #{e.message}"
       end
 
       # Returns [[KEY, reverse?], ...] or an error String.
@@ -1896,14 +2148,27 @@ module MailOnRails
       end
 
       # RFC 5256 §2.1 base subject, simplified: strip trailing "(fwd)"
-      # and leading re:/fw:/fwd: markers (with optional [blah]) until
-      # stable. Case-insensitive by downcasing.
+      # and leading re:/fw:/fwd: markers (with optional [blah]).
+      # Case-insensitive by downcasing.
       def base_subject(subject)
-        s = subject.to_s.gsub(/\s+/, " ").strip.downcase
-        loop do
+        strip_subject_markers(normalize_subject(subject))
+      end
+
+      # Whitespace-collapsed, downcased, and cut to MAX_BASE_SUBJECT_BYTES
+      # first (scrubbed, in case the cut split a multibyte character).
+      def normalize_subject(subject)
+        subject.to_s.byteslice(0, MAX_BASE_SUBJECT_BYTES).to_s.scrub.gsub(/\s+/, " ").strip.downcase
+      end
+
+      # Each marker run comes off in one anchored match, so the strip is
+      # linear in the subject however long the re: re: re: chain; a second
+      # pass catches a run the other end exposed ("re: x (fwd)" needs one
+      # of each), and a third can only be a no-op.
+      def strip_subject_markers(s)
+        2.times do
           before = s
-          s = s.sub(/\s*\(fwd\)\s*\z/, "")
-          s = s.sub(/\A\s*(?:re|fwd?)\s*(?:\[[^\]]*\])?\s*:\s*/, "")
+          s = s.sub(/\A(?:(?:re|fwd?) ?(?:\[[^\]]*\])? ?: ?)+/, "")
+          s = s.sub(/(?: ?\(fwd\))+ ?\z/, "")
           break if s == before
         end
         s
@@ -1927,9 +2192,11 @@ module MailOnRails
 
         @search_modseq = false
         hits = search_hits(args, uid_mode)
-        messages = fetch_messages(hits.map(&:last), true)
-        entries = hits.filter_map do |seq, uid|
-          (msg = messages[uid]) && thread_entry(seq, uid, msg, uid_mode)
+        # Threading facts are read off each batch's headers; raw bytes
+        # never accumulate.
+        entries = []
+        each_fetched(hits, true, budget: search_raw_budget) do |batch, messages|
+          batch.each { |seq, uid| (msg = messages[uid]) && entries << thread_entry(seq, uid, msg, uid_mode) }
         end
 
         threads = algorithm == "REFERENCES" ? references_threads(entries) : ordered_subject_threads(entries)
@@ -1937,6 +2204,8 @@ module MailOnRails
         tagged tag, "OK THREAD completed"
       rescue SearchSyntaxError => e
         tagged tag, "BAD #{e.message}"
+      rescue SearchLimitError => e
+        tagged tag, "NO [LIMIT] #{e.message}"
       end
 
       # The facts threading needs about one matched message, read off its
@@ -1945,8 +2214,9 @@ module MailOnRails
       # SORT).
       def thread_entry(seq, uid, msg, uid_mode)
         headers = Imap::Mime.parse_headers(Imap::Mime.split_header(msg[:raw].to_s)[0])
-        subject = headers["subject"]&.first.to_s
-        references = header_msg_ids(headers, "references")
+        subject = normalize_subject(headers["subject"]&.first)
+        base = strip_subject_markers(subject)
+        references = trim_references(header_msg_ids(headers, "references"))
         references = header_msg_ids(headers, "in-reply-to").first(1) if references.empty?
         date = begin
           Time.parse(headers["date"]&.first.to_s).to_i
@@ -1956,14 +2226,23 @@ module MailOnRails
         { num: uid_mode ? uid : seq, uid: uid, date: date,
           message_id: header_msg_ids(headers, "message-id").first,
           references: references,
-          subject: base_subject(subject),
+          subject: base,
           # A re:/fwd: prefix marks a reply for the subject-merge step
           # (the non-reply wins a merged thread's root).
-          reply: base_subject(subject) != subject.gsub(/\s+/, " ").strip.downcase }
+          reply: base != subject }
       end
 
       def header_msg_ids(headers, name)
         headers[name].to_a.flat_map { |v| v.scan(/<([^>]+)>/) }.flatten
+      end
+
+      # Keeps the oldest 8 and the newest ids of an over-long References
+      # chain (MAX_THREAD_REFERENCES in total): the root anchors the thread,
+      # the tail names the parent, the middle is what a hostile header pads.
+      def trim_references(ids)
+        return ids if ids.length <= MAX_THREAD_REFERENCES
+
+        ids.first(8) + ids.last(MAX_THREAD_REFERENCES - 8)
       end
 
       # ORDEREDSUBJECT ("poor man's threading"): one linear thread per
@@ -2033,21 +2312,39 @@ module MailOnRails
       # JWZ step 2: drop placeholders for messages outside the result
       # set, promoting their children - except that a placeholder at the
       # root keeps a multi-child sibling group together (it renders as
-      # "((a)(b))").
-      def prune_placeholders(nodes, root: true)
-        nodes.flat_map do |node|
-          node[:children] = prune_placeholders(node[:children], root: false)
-          if node[:entry]
-            [ node ]
-          elsif node[:children].empty?
-            []
-          elsif !root || node[:children].size == 1
-            node[:children].each { |c| c[:parent] = node[:parent] }
-            node[:children]
-          else
-            [ node ]
-          end
+      # "((a)(b))"). Bottom-up over an explicit traversal rather than
+      # recursion: a References chain is as deep as the client makes it,
+      # and the Ruby stack is not the place to find out how deep.
+      def prune_placeholders(roots)
+        descendants_first(roots).each do |node|
+          node[:children] = node[:children].flat_map { |child| prune_node(child, root: false) }
         end
+        roots.flat_map { |node| prune_node(node, root: true) }
+      end
+
+      def prune_node(node, root:)
+        if node[:entry]
+          [ node ]
+        elsif node[:children].empty?
+          []
+        elsif !root || node[:children].size == 1
+          node[:children].each { |c| c[:parent] = node[:parent] }
+          node[:children]
+        else
+          [ node ]
+        end
+      end
+
+      # Every node under +roots+ (inclusive), children before parents.
+      def descendants_first(roots)
+        order = []
+        stack = roots.dup
+        until stack.empty?
+          node = stack.pop
+          order << node
+          stack.concat(node[:children])
+        end
+        order.reverse!
       end
 
       # RFC 5256 step 4: root threads sharing a base subject merge into
@@ -2098,11 +2395,17 @@ module MailOnRails
       end
 
       # RFC 5256 steps 5-6: siblings sort by sent date (mailbox order as
-      # the tiebreak), recursively; the root set sorts the same way, a
-      # placeholder counting as its first (sorted) child.
+      # the tiebreak), deepest lists first so that a placeholder's first
+      # child is already its earliest; the root set sorts the same way.
+      # Iterative, like prune_placeholders.
       def sort_threads(nodes)
-        nodes.each { |node| sort_threads(node[:children]) }
-        nodes.sort_by! { |node| thread_sort_key(node) }
+        lists = [ nodes ]
+        i = 0
+        while i < lists.length
+          lists[i].each { |node| lists << node[:children] unless node[:children].empty? }
+          i += 1
+        end
+        lists.reverse_each { |list| list.sort_by! { |node| thread_sort_key(node) } }
       end
 
       def thread_sort_key(node)
@@ -2113,46 +2416,73 @@ module MailOnRails
       # RFC 5256 rendering: a linear descent stays in one list
       # ("(2 3 4)"); a fork nests each branch ("(2 (3)(4))"); a
       # parentless sibling group opens with a nested thread ("((3)(4))").
-      def render_thread(node)
-        parts = []
-        while node
-          parts << node[:entry][:num].to_s if node[:entry]
-          case node[:children].size
-          when 0 then node = nil
-          when 1 then node = node[:children].first
-          else
-            parts << node[:children].map { |child| render_thread(child) }.join
-            node = nil
+      # Forks are rendered from a work stack (a pending ")" closes the
+      # enclosing list once its branches are out), not by recursion.
+      def render_thread(root)
+        out = +""
+        work = [ root ]
+        until work.empty?
+          item = work.pop
+          next out << item if item.is_a?(String)
+
+          out << "("
+          node = item
+          parts = []
+          while node
+            parts << node[:entry][:num].to_s if node[:entry]
+            case node[:children].size
+            when 0 then node = nil
+            when 1 then node = node[:children].first
+            else
+              out << parts.join(" ") << (parts.empty? ? "" : " ")
+              parts = nil
+              work << ")"
+              node[:children].reverse_each { |child| work << child }
+              node = nil
+            end
           end
+          out << parts.join(" ") << ")" if parts
         end
-        "(#{parts.join(" ")})"
+        out
       end
 
       # Evaluates search-key tokens against the current snapshot and
-      # returns matching [seq, uid] pairs in mailbox order. Two-phase:
-      # metadata keys (flags, dates, sizes, sets) run against the cheap
-      # metadata fetch; message bytes are pulled only for survivors that
-      # content keys still need. Raises SearchSyntaxError on bad keys.
+      # returns matching [seq, uid] pairs in mailbox order. Three phases,
+      # each over the previous one's survivors: snapshot-level keys need
+      # no store call at all (UID SEARCH UID 1 on a million messages
+      # touches none of them); metadata keys fetch in batches without raw
+      # bytes; content keys the store can't answer pull raw bytes in
+      # batches, under the MAX_SEARCH_RAW_* budget. Raises
+      # SearchSyntaxError on bad keys, SearchLimitError past the budget.
       def search_hits(criteria, uid_mode)
         matchers = []
         matchers << parse_search_key(criteria, uid_mode) until criteria.empty?
         matchers.compact!
-        meta_keys, raw_keys = matchers.partition { |k| !k.raw? }
+        by_level = matchers.group_by(&:level)
+        snapshot_keys = by_level.fetch(LEVEL_SNAPSHOT, [])
 
-        all = @uids.each_with_index.map { |uid, idx| [ idx + 1, uid ] }
-        messages = fetch_messages(@uids, false)
-        hits = all.select do |seq, uid|
-          msg = messages[uid]
-          msg && meta_keys.all? { |k| k.call(seq, msg) }
+        # One reusable stub: snapshot keys read uid from it and flags /
+        # modseq from the session tables, never from a fetched row.
+        stub = {}
+        hits = []
+        @uids.each_with_index do |uid, idx|
+          stub[:uid] = uid
+          hits << [ idx + 1, uid ] if snapshot_keys.all? { |k| k.call(idx + 1, stub) }
         end
-        if raw_keys.any? && hits.any?
-          raw_messages = fetch_messages(hits.map(&:last), true)
-          hits = hits.select do |seq, uid|
-            msg = raw_messages[uid]
-            msg && raw_keys.all? { |k| k.call(seq, msg) }
+        hits = filter_fetched(hits, by_level[LEVEL_META], false) if by_level[LEVEL_META] && hits.any?
+        hits = filter_fetched(hits, by_level[LEVEL_RAW], true) if by_level[LEVEL_RAW] && hits.any?
+        hits
+      end
+
+      def filter_fetched(pairs, keys, need_raw)
+        survivors = []
+        each_fetched(pairs, need_raw, budget: need_raw ? search_raw_budget : nil) do |batch, messages|
+          batch.each do |seq, uid|
+            msg = messages[uid]
+            survivors << [ seq, uid ] if msg && keys.all? { |k| k.call(seq, msg) }
           end
         end
-        hits
+        survivors
       end
 
       # RFC 5182: SAVE stores the matched UIDs as the "$" variable. When
@@ -2197,7 +2527,9 @@ module MailOnRails
         parts << "MAX #{ids.max}" if opts.include?("MAX") && ids.any?
         parts << "COUNT #{ids.size}" if opts.include?("COUNT")
         parts << "ALL #{compress_set(ids)}" if opts.include?("ALL") && ids.any?
-        out = +%(ESEARCH (TAG "#{tag}"))
+        # The tag is client-supplied: quoted/escaped (or a literal) so it
+        # can't close the string early or forge response text.
+        out = +"ESEARCH (TAG #{Imap::Mime.quote(tag)})"
         out << " UID" if uid_mode
         out << " " << parts.join(" ") if parts.any?
         out
@@ -2221,12 +2553,12 @@ module MailOnRails
           keys << parse_search_key(toks, uid_mode, depth + 1) until toks.empty? || toks.first == :rparen
           toks.shift
           keys.compact!
-          return SearchKey.new(keys.any?(&:raw?), ->(seq, msg) { keys.all? { |k| k.call(seq, msg) } })
+          return SearchKey.new(keys.map(&:level).max || LEVEL_SNAPSHOT, ->(seq, msg) { keys.all? { |k| k.call(seq, msg) } })
         end
         return nil unless tok.is_a?(String)
 
         case tok.upcase
-        when "ALL" then meta_key { |_seq, _msg| true }
+        when "ALL" then snapshot_key { |_seq, _msg| true }
         when "ANSWERED"   then flag_key("\\Answered")
         when "DELETED"    then flag_key("\\Deleted")
         when "DRAFT"      then flag_key("\\Draft")
@@ -2237,8 +2569,8 @@ module MailOnRails
         when "UNDRAFT"    then negate(flag_key("\\Draft"))
         when "UNFLAGGED"  then negate(flag_key("\\Flagged"))
         when "UNSEEN"     then negate(flag_key("\\Seen"))
-        when "RECENT", "NEW" then meta_key { |_seq, _msg| false }
-        when "OLD" then meta_key { |_seq, _msg| true }
+        when "RECENT", "NEW" then snapshot_key { |_seq, _msg| false }
+        when "OLD" then snapshot_key { |_seq, _msg| true }
         when "KEYWORD" then flag_key(toks.shift.to_s)
         when "UNKEYWORD" then negate(flag_key(toks.shift.to_s))
         when "NOT"
@@ -2251,10 +2583,10 @@ module MailOnRails
           b = parse_search_key(toks, uid_mode, depth + 1)
           raise SearchSyntaxError, "OR expects two search keys" if a.nil? || b.nil?
 
-          SearchKey.new(a.raw? || b.raw?, ->(seq, msg) { a.call(seq, msg) || b.call(seq, msg) })
+          SearchKey.new([ a.level, b.level ].max, ->(seq, msg) { a.call(seq, msg) || b.call(seq, msg) })
         when "UID"
-          uids = resolve_set(toks.shift.to_s, true).map(&:last)
-          meta_key { |_seq, msg| uids.include?(msg[:uid]) }
+          uids = resolve_set(toks.shift.to_s, true).map(&:last).to_set
+          snapshot_key { |_seq, msg| uids.include?(msg[:uid]) }
         when "LARGER"  then min = toks.shift.to_i; meta_key { |_seq, msg| msg[:size] > min }
         when "SMALLER" then max = toks.shift.to_i; meta_key { |_seq, msg| msg[:size] < max }
         when "SINCE"  then date_key(toks.shift) { |msg_day, day| msg_day >= day }
@@ -2294,37 +2626,42 @@ module MailOnRails
           value = toks.shift.to_s.to_i
           @condstore = true
           @search_modseq = true
-          meta_key { |_seq, msg| (@modseqs[msg[:uid]] || 1) >= value }
+          snapshot_key { |_seq, msg| (@modseqs[msg[:uid]] || 1) >= value }
         when "$"
           # SEARCHRES: the saved search result as a search key.
-          meta_key { |_seq, msg| @saved_search.include?(msg[:uid]) }
+          saved = @saved_search.to_set
+          snapshot_key { |_seq, msg| saved.include?(msg[:uid]) }
         when /\A[\d*][\d,:*]*\z/
-          pairs = resolve_set(tok, false)
-          seqs = pairs.map(&:first)
-          meta_key { |seq, _msg| seqs.include?(seq) }
+          seqs = resolve_set(tok, false).map(&:first).to_set
+          snapshot_key { |seq, _msg| seqs.include?(seq) }
         else
           raise SearchSyntaxError, "Unknown search key #{tok.upcase}"
         end
       end
 
+      def snapshot_key(&fn)
+        SearchKey.new(LEVEL_SNAPSHOT, fn)
+      end
+
       def meta_key(&fn)
-        SearchKey.new(false, fn)
+        SearchKey.new(LEVEL_META, fn)
       end
 
       def raw_key(&fn)
-        SearchKey.new(true, fn)
+        SearchKey.new(LEVEL_RAW, fn)
       end
 
       def negate(key)
         return nil if key.nil?
 
-        SearchKey.new(key.raw?, ->(seq, msg) { !key.call(seq, msg) })
+        SearchKey.new(key.level, ->(seq, msg) { !key.call(seq, msg) })
       end
 
       # Flags are grammar atoms and therefore case-insensitive (RFC 9051
       # formal-syntax rules): KEYWORD Custom1 matches a stored "custom1".
+      # Read from the session's flag table - the snapshot is authoritative.
       def flag_key(flag)
-        meta_key { |_seq, msg| (@flags[msg[:uid]] || msg[:flags]).any? { |f| f.casecmp?(flag) } }
+        snapshot_key { |_seq, msg| (@flags[msg[:uid]] || msg[:flags] || []).any? { |f| f.casecmp?(flag) } }
       end
 
       def date_key(str, &compare)
@@ -2373,9 +2710,22 @@ module MailOnRails
         meta_key { |_seq, msg| compare.call(now - msg[:internal_date], seconds) }
       end
 
+      # Header fields the store can search from its own columns
+      # (search_header in the store contract): FROM/TO/SUBJECT and their
+      # HEADER <field> spellings. Everything else needs the raw header.
+      PUSHDOWN_HEADERS = %w[from to subject].freeze
+
       def header_key(name, value)
         name = name.downcase
         value = value.downcase
+        if PUSHDOWN_HEADERS.include?(name) && @store.respond_to?(:search_header) && value.match?(/[[:alnum:]]/)
+          uids = nil
+          return snapshot_key do |_seq, msg|
+            uids ||= (@store.search_header(@selected[:mailbox_id], name, value)[:uids] || []).to_set
+            uids.include?(msg[:uid])
+          end
+        end
+
         raw_key do |_seq, msg|
           headers = Imap::Mime.parse_headers(Imap::Mime.split_header(msg[:raw].to_s)[0])
           headers[name].to_a.any? { |v| v.downcase.include?(value) }
@@ -2393,8 +2743,8 @@ module MailOnRails
         return substring_key(value, scope) unless @store.respond_to?(:search_text) && value.match?(/[[:alnum:]]/)
 
         uids = nil
-        meta_key do |_seq, msg|
-          uids ||= @store.search_text(@selected[:mailbox_id], value, scope)[:uids] || []
+        snapshot_key do |_seq, msg|
+          uids ||= (@store.search_text(@selected[:mailbox_id], value, scope)[:uids] || []).to_set
           uids.include?(msg[:uid])
         end
       end
@@ -2457,7 +2807,7 @@ module MailOnRails
 
         result = @store.append(@account_id, name, message, flags, date_epoch)
         if result[:error]
-          tagged tag, "NO #{error_response_code(result)}APPEND failed: #{result[:error]}"
+          store_failure(tag, "APPEND", result)
         else
           # An APPEND into the selected mailbox must surface as an
           # untagged EXISTS (RFC 3501 §6.3.11) before the tagged OK.
@@ -2475,7 +2825,7 @@ module MailOnRails
         if (open_idx = args.index(:lparen))
           close_idx = args.index(:rparen) || args.length
           flags = parse_flag_list(args[(open_idx + 1)...close_idx].select { |a| a.is_a?(String) })
-          return "Unknown system flag" if flags.nil?
+          return "Invalid flag list" if flags.nil?
 
           flags = flags.reject { |f| f == "\\Recent" }
           args = args[(close_idx + 1)..] || []
@@ -2514,9 +2864,7 @@ module MailOnRails
         return tagged(tag, "BAD #{flags}") if flags.is_a?(String)
 
         result = @store.append(@account_id, name, message, flags, date_epoch)
-        if result[:error]
-          return tagged(tag, "NO #{error_response_code(result)}REPLACE failed: #{result[:error]}")
-        end
+        return store_failure(tag, "REPLACE", result) if result[:error]
 
         untagged "OK [APPENDUID #{result[:uid_validity]} #{result[:uid]}] Replacement ready"
 
@@ -2594,8 +2942,9 @@ module MailOnRails
         if @qresync
           untagged "VANISHED #{compress_set(removed)}" if removed.any?
         else
+          gone = removed.to_set
           @uids.each_with_index.to_a.reverse_each do |uid, idx|
-            untagged "#{idx + 1} EXPUNGE" if removed.include?(uid)
+            untagged "#{idx + 1} EXPUNGE" if gone.include?(uid)
           end
         end
         take_snapshot(result)

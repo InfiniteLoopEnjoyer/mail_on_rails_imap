@@ -158,4 +158,68 @@ class ImapBackendTest < MailOnRails::Testing::Database::TestCase
     backend.store_flags(inbox.id, [ message.uid ], "+", [ "\\Seen" ])
     assert_equal 0, inbox.unseen_count
   end
+
+  # -- store exceptions on the wire --------------------------------------------
+
+  # An IMAP session over a socket pair, on this Active Record store: the
+  # full Store::Base#db -> session path, so what the client sees when the
+  # database itself rejects a write is what production would send.
+  def with_wire_session
+    account
+    server, client = UNIXSocket.pair
+    session = MailOnRails::ImapServer::Session.new(server, backend, { tls: :implicit }, nil)
+    thread = Thread.new { session.run }
+    client.timeout = 10
+    client.gets("\r\n")
+    client.write("l0 LOGIN #{account.email} a-long-test-password\r\n")
+    reply = read_until_tagged(client, "l0")
+    assert_match(/\Al0 OK/, reply)
+    yield client
+  ensure
+    client&.close
+    thread&.join(5)
+  end
+
+  def read_until_tagged(client, tag)
+    lines = []
+    while (line = client.gets("\r\n"))
+      lines << line
+      break if line.start_with?("#{tag} ")
+    end
+    lines.join
+  end
+
+  def wire_append(client, tag, raw, date: nil)
+    args = [ "INBOX" ]
+    args << %("#{date}") if date
+    client.write("#{tag} APPEND #{args.join(" ")} {#{raw.bytesize}+}\r\n#{raw}\r\n")
+    read_until_tagged(client, tag)
+  end
+
+  # Time.strptime accepts a nine-digit year; whatever the adapter then
+  # does with it (SQLite stores it, PostgreSQL raises), the reply names no
+  # adapter, table or SQL.
+  test "an APPEND the database rejects answers a fixed temporary failure" do
+    with_wire_session do |client|
+      reply = wire_append(client, "a1", RAW, date: "01-Jan-999999999 00:00:00 +0000")
+      assert_match(/\Aa1 (OK|NO \[UNAVAILABLE\] APPEND failed: temporary server error)\r\n\z/, reply)
+      refute_match(/ActiveRecord|PG::|SQLite|Mysql|SELECT|INSERT|mail_on_rails_/, reply)
+
+      # Force the adapter failure regardless of what SQLite tolerates.
+      singleton = MailOnRails::EmailMessage.singleton_class
+      original = MailOnRails::EmailMessage.method(:deliver_raw)
+      singleton.define_method(:deliver_raw) do |*_args, **_kwargs|
+        raise ActiveRecord::StatementInvalid, "PG::DatetimeFieldOverflow: ERROR: date/time field value out of " \
+                                              "range: INSERT INTO mail_on_rails_email_messages"
+      end
+      begin
+        reply = wire_append(client, "a2", RAW)
+      ensure
+        singleton.define_method(:deliver_raw, original)
+      end
+      assert_equal "a2 NO [UNAVAILABLE] APPEND failed: temporary server error\r\n", reply
+      client.write("a3 NOOP\r\n")
+      assert_match(/\Aa3 OK/, read_until_tagged(client, "a3"), "session survives")
+    end
+  end
 end

@@ -29,19 +29,27 @@ module MailOnRails
       # acceptable output for a malicious message.
       MAX_DEPTH = 20
       MAX_PARTS = 1000
+      # Every nesting level copies its body into the child parts (the
+      # container splits it, the child re-slices it), so a message nested
+      # to MAX_DEPTH would hold ~2x its size per level. The parse stops
+      # descending once the copies made exceed this multiple of the
+      # top-level message; real mail is two or three levels deep.
+      MAX_COPY_FACTOR = 8
 
       def parse(raw, depth: 0, budget: nil)
-        budget ||= { parts: MAX_PARTS }
-        raw = raw.to_s.dup.force_encoding(Encoding::BINARY)
+        raw = raw.to_s.b
+        budget ||= { parts: MAX_PARTS, bytes: raw.bytesize * MAX_COPY_FACTOR }
+        budget[:bytes] -= raw.bytesize if depth.positive?
         header_block, body = split_header(raw)
         headers = parse_headers(header_block)
         type, subtype, params = parse_content_type(headers["content-type"]&.first)
         part = Part.new(header_block: header_block, headers: headers, body: body,
                         type: type, subtype: subtype, params: params)
 
-        return part unless depth < MAX_DEPTH && budget[:parts].positive?
+        return part unless depth < MAX_DEPTH && budget[:parts].positive? && budget[:bytes].positive?
 
         if part.multipart? && params["boundary"]
+          budget[:bytes] -= body.bytesize # the split's own copy
           chunks = split_multipart(body, params["boundary"]).first(budget[:parts])
           budget[:parts] -= chunks.size
           part.children = chunks.map { |chunk| parse(chunk, depth: depth + 1, budget: budget) }
@@ -163,9 +171,11 @@ module MailOnRails
         target.message_rfc822? ? target.embedded : nil
       end
 
+      # Part numbers count from 1 (RFC 3501 §6.4.5); "0" names nothing,
+      # and must not read as Ruby's last-element index.
       def dig_part(part, numbers)
         numbers.inject(part) do |cur, n|
-          return nil unless cur
+          return nil unless cur && n.positive?
 
           cur = cur.embedded if cur.message_rfc822?
           if cur.multipart?

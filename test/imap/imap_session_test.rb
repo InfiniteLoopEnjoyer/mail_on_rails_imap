@@ -641,7 +641,7 @@ class ImapSessionTest < Minitest::Test
     end
   end
 
-  def test_search_fetches_raw_bytes_only_for_metadata_survivors
+  def test_search_fetches_raw_bytes_only_for_snapshot_survivors
     spy = SpyStore.new
     @store = spy
     @account_id = spy.add_account(email: EMAIL, password: PASSWORD)
@@ -650,13 +650,16 @@ class ImapSessionTest < Minitest::Test
 
     with_session do |client|
       login_and_select(client)
+      # DELETED and SUBJECT (store pushdown) cost no fetch at all...
       assert_match(/\A\* SEARCH 1\r\n/, command(client, "q1", "SEARCH DELETED SUBJECT hi"))
-      command(client, "q2", "LOGOUT")
+      # ...and a key that truly needs message bytes (a non-pushdown
+      # header) fetches only the \Deleted survivor, metadata then raw.
+      assert_match(/\A\* SEARCH 1\r\n/, command(client, "q2", %(SEARCH DELETED NOT HEADER "received" "x")))
+      command(client, "q3", "LOGOUT")
     end
 
-    assert_includes spy.fetches, [ [ 1, 2 ], false ], "metadata pass should cover the whole mailbox"
-    assert_equal [ [ [ 1 ], true ] ], spy.fetches.select { |_uids, raw| raw },
-                 "raw bytes should be fetched only for the \\Deleted survivor"
+    assert_equal [ [ [ 1 ], false ], [ [ 1 ], true ] ], spy.fetches,
+                 "fetches only for the snapshot survivor of the raw-key search"
   end
 
   def test_append_and_expunge_round_trip

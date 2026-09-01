@@ -84,6 +84,48 @@ class SortTest < Minitest::Test
     assert_match(/\Ax7 BAD/, command(c, "x7", "SORT (ARRIVAL) UTF-8 BOGUSKEY"))
   end
 
+  # RFC 5256 §2.1 base-subject cases the single-pass strip must keep
+  # answering like the old strip-until-stable loop did.
+  test "base subject semantics" do
+    session = MailOnRails::ImapServer::Session.new(nil, @store, { tls: :implicit }, nil)
+    base = ->(s) { session.send(:base_subject, s) }
+    assert_equal "apple", base.call("Re: apple")
+    assert_equal "apple", base.call("RE: FWD: Fw: re: apple")
+    assert_equal "apple", base.call("re[2]: apple")
+    assert_equal "apple", base.call("apple (fwd)")
+    assert_equal "apple", base.call("apple (fwd) (FWD)")
+    assert_equal "apple", base.call("re: apple (fwd)")
+    assert_equal "apple", base.call("Fwd:   apple   (fwd)")
+    assert_equal "apple pie", base.call("  Re:\tapple \r\n pie ")
+    assert_equal "(fwd) re: x", base.call("re: (fwd) re: x (fwd)")
+    assert_equal "", base.call("")
+    assert_equal "", base.call(nil)
+    assert_equal "reply", base.call("reply"), "a bare word starting with re is not a marker"
+  end
+
+  # A subject that is one long re: re: re: chain is stripped in linear
+  # time (the old loop re-copied the subject per marker: 400 KB of them
+  # took minutes), and a subject past MAX_BASE_SUBJECT_BYTES is cut
+  # before normalizing.
+  test "a 400 KB re: chain sorts promptly" do
+    session = MailOnRails::ImapServer::Session.new(nil, @store, { tls: :implicit }, nil)
+    subject = "re: " * 100_000 + "apple"
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    result = session.send(:base_subject, subject)
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.25
+    assert_equal "", result, "a cut chain of markers has no base subject left"
+    assert_operator session.send(:base_subject, "x" * 5000).bytesize, :<=, MailOnRails::ImapServer::MAX_BASE_SUBJECT_BYTES
+
+    @store.append(@account_id, "INBOX", build(from: "a@x.test", subject: subject, date: "Sat, 1 Jan 2022 10:00:00 +0000"), [], nil)
+    @store.append(@account_id, "INBOX", build(from: "b@x.test", subject: "apple", date: "Sat, 1 Jan 2022 10:00:00 +0000"), [], nil)
+    c = connect
+    command(c, "s0", "SELECT INBOX")
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    reply = command(c, "s1", "SORT (SUBJECT) UTF-8 ALL")
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 2
+    assert_match(/^\* SORT 1 2\r\n/, reply, "the empty base subject sorts first")
+  end
+
   test "sort requires a selected mailbox" do
     c = connect
     assert_match(/\An1 NO/, command(c, "n1", "SORT (ARRIVAL) UTF-8 ALL"))

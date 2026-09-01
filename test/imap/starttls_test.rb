@@ -33,13 +33,13 @@ class StarttlsTest < Minitest::Test
 
   # A session on a plaintext (STARTTLS-capable) listener. tls_ctx nil
   # models a listener with no TLS material at all.
-  def plaintext_session(tls_ctx: self.class.tls_context)
+  def plaintext_session(tls_ctx: self.class.tls_context, spec: {})
     server = TCPServer.new("127.0.0.1", 0)
     client = TCPSocket.new("127.0.0.1", server.addr[1])
     client.timeout = 5
     session_socket = server.accept
     thread = Thread.new do
-      MailOnRails::ImapServer::Session.new(session_socket, @store, { tls: :starttls }, tls_ctx).run
+      MailOnRails::ImapServer::Session.new(session_socket, @store, { tls: :starttls }.merge(spec), tls_ctx).run
     end
     @cleanup << -> { client.close }
     @cleanup << -> { thread.join(5) }
@@ -177,6 +177,63 @@ class StarttlsTest < Minitest::Test
     # The smuggled LOGIN neither ran nor produced a response: the session is
     # still unauthenticated, and the next tagged reply is a3's.
     assert_match(/\Aa3 NO Not authenticated/, command(tls, "a3", "SELECT INBOX"))
+  end
+
+  # -- timeouts --------------------------------------------------------------
+
+  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  # True once the server has closed its end (within +seconds+).
+  def closed_within?(client, seconds)
+    client.timeout = seconds
+    client.gets("\r\n").nil?
+  rescue IO::TimeoutError
+    false
+  rescue IOError, SystemCallError
+    true
+  end
+
+  # A peer that sends STARTTLS and then no ClientHello is dropped after the
+  # accept-side handshake timeout, not held for the session's inactivity
+  # timeout.
+  test "a stalled starttls handshake is bounded by the handshake timeout" do
+    client = plaintext_session(spec: { handshake_timeout: 0.5, timeout: 30, preauth_timeout: 30 })
+    client.gets("\r\n")
+    assert_match(/\Aa1 OK Begin TLS/, command(client, "a1", "STARTTLS"))
+    started = monotonic
+    assert closed_within?(client, 5), "the handshake must time out"
+    assert_operator monotonic - started, :<, 4
+  end
+
+  # Before authentication only PREAUTH_TIMEOUT of silence is allowed; after
+  # a login the configured session timeout applies.
+  test "an unauthenticated session times out on the short pre-auth bound" do
+    client = plaintext_session(spec: { preauth_timeout: 0.5, timeout: 30 })
+    client.gets("\r\n")
+    started = monotonic
+    assert closed_within?(client, 5), "an idle pre-auth session must be closed"
+    assert_operator monotonic - started, :<, 4
+  end
+
+  test "authentication switches to the configured session timeout" do
+    client = plaintext_session(spec: { preauth_timeout: 0.5, timeout: 30 })
+    client.gets("\r\n")
+    command(client, "a1", "STARTTLS")
+    tls = tls_connect(client)
+    assert_match(/\Aa2 OK/, command(tls, "a2", "LOGIN #{EMAIL} #{PASSWORD}"))
+    sleep 1.0
+    assert_match(/\Aa3 OK/, command(tls, "a3", "NOOP"), "the pre-auth bound must no longer apply")
+  end
+
+  # The default: PREAUTH_TIMEOUT is well under the session default and is
+  # what a fresh session runs with.
+  test "the pre-auth timeout defaults below the session timeout" do
+    session = MailOnRails::ImapServer::Session.new(nil, @store, { tls: :implicit }, nil)
+    assert_equal MailOnRails::ImapServer::PREAUTH_TIMEOUT, session.send(:session_timeout)
+    assert_operator MailOnRails::ImapServer::PREAUTH_TIMEOUT, :<=, 120
+    session.instance_variable_set(:@account_id, 1)
+    assert_equal 1800, session.send(:session_timeout)
+    assert_equal MailOnRails::Netserv::Server::HANDSHAKE_TIMEOUT, session.send(:handshake_timeout)
   end
 
   # Same attack aimed at the state reset rather than at authentication: even

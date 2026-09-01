@@ -598,6 +598,45 @@ module MailOnRails
             assert_equal [], store.search_text(-1, "kumquat", "text")[:uids]
           end
 
+          # -- search_header (optional FROM/TO/SUBJECT pushdown) ---------------
+          # Like search_text, for the three header fields a store keeps
+          # columns for: case-insensitive, at least whole-word matching of
+          # the named field only, ascending uids. A store may match more
+          # generously (the memory store does exact RFC 3501 substrings of
+          # the header value); it must never match a field the query
+          # didn't name. Stores without it skip these - the IMAP server
+          # scans raw headers instead.
+
+          def header_seed
+            skip "store does not implement search_header" unless store.respond_to?(:search_header)
+            uid = store.append(account_id, "INBOX", SEARCHABLE_RAW, [], nil)[:uid]
+            store.append(account_id, "INBOX", UNRELATED_RAW, [], nil)
+            [ store.select_mailbox(account_id, "INBOX")[:mailbox_id], uid ]
+          end
+
+          def test_search_header_matches_the_named_field_case_insensitively
+            mailbox_id, uid = header_seed
+            assert_equal [ uid ], store.search_header(mailbox_id, "subject", "QUARTERLY")[:uids]
+            assert_equal [ uid ], store.search_header(mailbox_id, "from", "sender@example.test")[:uids]
+            assert_equal [ uid ], store.search_header(mailbox_id, "to", "rcpt@example.test")[:uids]
+            assert_equal [], store.search_header(mailbox_id, "subject", "zebra")[:uids]
+          end
+
+          def test_search_header_never_matches_another_field_or_the_body
+            mailbox_id, = header_seed
+            assert_equal [], store.search_header(mailbox_id, "subject", "kumquat")[:uids]
+            assert_equal [], store.search_header(mailbox_id, "to", "sender@example.test")[:uids]
+          end
+
+          def test_search_header_returns_ascending_uids_and_empty_for_unknown_mailbox
+            mailbox_id, = header_seed
+            third = store.append(account_id, "INBOX", SEARCHABLE_RAW, [], nil)[:uid]
+            uids = store.search_header(mailbox_id, "subject", "quarterly")[:uids]
+            assert_includes uids, third
+            assert_equal uids.sort, uids
+            assert_equal [], store.search_header(-1, "subject", "quarterly")[:uids]
+          end
+
           # -- quota (optional storage accounting) ------------------------------
           # A store that implements quota(account_id) reports used_bytes
           # (the sum of stored message sizes, CRLF-normalized) and

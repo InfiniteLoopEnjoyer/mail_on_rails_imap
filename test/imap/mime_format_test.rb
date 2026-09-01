@@ -54,6 +54,29 @@ class MimeFormatTest < Minitest::Test
     assert_match(/\A\(\("TEXT" "PLAIN" .*\)\("TEXT" "HTML" .*\) "ALTERNATIVE"\)\z/, structure)
   end
 
+  # Part numbers count from 1: BODY[0] names no part (never the last child
+  # via a negative Ruby index), and neither does a zero inside a path.
+  def test_section_zero_names_no_part
+    raw = <<~MSG.gsub("\n", "\r\n")
+      Content-Type: multipart/mixed; boundary=b
+
+      --b
+      Content-Type: text/plain
+
+      first
+      --b
+      Content-Type: text/plain
+
+      last
+      --b--
+    MSG
+    part = Mime.parse(raw)
+    assert_nil Mime.section(part, "0")
+    assert_nil Mime.section(part, "1.0")
+    assert_nil Mime.section(part, "0.1")
+    assert_equal "last", Mime.section(part, "2")
+  end
+
   def test_quote_escapes_backslashes_and_quotes
     assert_equal %("a\\"b\\\\c"), Mime.quote(%(a"b\\c))
   end

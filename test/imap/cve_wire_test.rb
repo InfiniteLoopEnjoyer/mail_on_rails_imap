@@ -238,21 +238,133 @@ class CveWireTest < Minitest::Test
     assert_match(/\As2 OK/, command(c, "s2", "NOOP"))
   end
 
-  # A control byte carried in a STORE keyword must not break response framing:
-  # whatever the server does with the keyword, the FETCH/STORE reply is still a
-  # single CRLF-terminated line - a control byte cannot split the stream the
-  # way a CRLF would.
+  # A control byte carried in a STORE keyword is not an atom: the flag list
+  # is refused with BAD (nothing stored, nothing echoed) and the reply is a
+  # single CRLF-terminated line - a control byte cannot split the stream
+  # the way a CRLF would.
   test "a control byte in a keyword flag cannot break response framing" do
     @store.append(@account_id, "INBOX", "From: s@r.test\r\nSubject: k\r\n\r\nx\r\n", [], nil)
     c = connect
     command(c, "k0", "SELECT INBOX")
     reply = command(c, "k1", "STORE 1 +FLAGS (foo\x01bar)")
-    assert_match(/^k1 (OK|BAD)/, reply)
-    # Response framing is intact: the STORE emits exactly one untagged FETCH
-    # line before its tagged completion - a control byte in the keyword did
-    # not split the stream into extra bogus responses the way a CRLF would.
-    assert_equal 2, reply.scan("\r\n").size, "the control byte must not add response lines"
+    assert_match(/\Ak1 BAD/, reply)
+    assert_equal 1, reply.scan("\r\n").size, "the control byte must not add response lines"
     refute_match(/^\* \d+ EXISTS/, reply)
-    assert_match(/\Ak2 OK/, command(c, "k2", "NOOP"))
+    refute_match(/foo/, command(c, "k2", "FETCH 1 (FLAGS)"), "the keyword was never stored")
+    assert_match(/\Ak3 OK/, command(c, "k3", "NOOP"))
+  end
+
+  # Flags may arrive as literals, so a keyword can carry CRLF: it is
+  # rejected by the atom grammar before it can be stored and later echoed
+  # as "* 5 EXPUNGE" in the middle of a FETCH response.
+  test "a literal keyword carrying CRLF is refused and never echoed" do
+    @store.append(@account_id, "INBOX", "From: s@r.test\r\nSubject: k\r\n\r\nx\r\n", [], nil)
+    c = connect
+    command(c, "k0", "SELECT INBOX")
+    payload = "x)\r\n* 5 EXPUNGE\r\n"
+    c.write("k1 STORE 1 +FLAGS ({#{payload.bytesize}}\r\n")
+    assert_match(/\A\+ /, read_line(c))
+    c.write("#{payload})\r\n")
+    reply = read_until_tagged(c, "k1")
+    assert_match(/\Ak1 BAD/, reply)
+    refute_match(/EXPUNGE/, reply)
+    assert_equal 1, reply.scan("\r\n").size
+    fetched = command(c, "k2", "FETCH 1 (FLAGS)")
+    refute_match(/EXPUNGE/, fetched)
+    assert_match(/FLAGS \(\)/, fetched)
+    assert_match(/\Ak3 OK/, command(c, "k3", "NOOP"))
+  end
+
+  # The keyword grammar and caps: atom-specials, 8-bit, over-long, and
+  # too many keywords are BAD on STORE and APPEND alike; a plain keyword
+  # at the size cap is fine.
+  test "keyword flags must be short atoms and few" do
+    @store.append(@account_id, "INBOX", "From: s@r.test\r\nSubject: k\r\n\r\nx\r\n", [], nil)
+    c = connect
+    command(c, "k0", "SELECT INBOX")
+    max = MailOnRails::ImapServer::MAX_KEYWORD_BYTES
+    [ "a]b", "a%b", "a*b", "a{b", "a\"b", "a\\b", "\xC3\xA9".b, "k" * (max + 1) ].each_with_index do |bad, i|
+      c.write("b#{i} STORE 1 +FLAGS ({#{bad.bytesize}+}\r\n#{bad})\r\n")
+      assert_match(/\Ab#{i} BAD/, read_until_tagged(c, "b#{i}"), bad.inspect)
+    end
+    many = Array.new(MailOnRails::ImapServer::MAX_KEYWORDS + 1) { |i| "kw#{i}" }.join(" ")
+    assert_match(/\Ab9 BAD/, command(c, "b9", "STORE 1 +FLAGS (#{many})"))
+    assert_match(/\Ab10 BAD/, append(c, "b10", "INBOX", "x", flags: [ "bad]kw" ]))
+    assert_match(/^b11 OK/, command(c, "b11", "STORE 1 +FLAGS (#{"k" * max} $Label1)"))
+    assert_match(/FLAGS \(#{"k" * max} \$Label1\)/, command(c, "b12", "FETCH 1 (FLAGS)"))
+  end
+
+  # The ESEARCH TAG correlator is client-supplied and must be quoted and
+  # escaped, so a backslash (or quote) in the tag can't close the string.
+  test "the esearch tag correlator is quoted and escaped" do
+    @store.append(@account_id, "INBOX", "From: s@r.test\r\nSubject: k\r\n\r\nx\r\n", [], nil)
+    c = connect
+    command(c, "e0", "SELECT INBOX")
+    reply = command(c, 't\1', "SEARCH RETURN (COUNT) ALL")
+    assert_match(/^\* ESEARCH \(TAG "t\\\\1"\) COUNT 1\r\n/, reply)
+    assert_match(/^t\\1 OK/, reply)
+  end
+
+  # Credentials are redacted from the transcript even when the command
+  # line carries leading whitespace (which the lexer tolerates).
+  test "login and authenticate lines are redacted regardless of leading whitespace" do
+    session = MailOnRails::ImapServer::Session.new(nil, @store, { tls: :implicit }, nil)
+    assert_equal "a1 LOGIN [redacted]", session.send(:redact_imap, "  a1 login user pass")
+    assert_equal "a1 LOGIN [redacted]", session.send(:redact_imap, "\ta1 LOGIN user pass")
+    assert_equal "a2 AUTHENTICATE PLAIN [redacted]", session.send(:redact_imap, " \t a2 AUTHENTICATE PLAIN AHUAcA==")
+    assert_equal "a2 AUTHENTICATE PLAIN", session.send(:redact_imap, "   a2 authenticate PLAIN")
+    assert_equal "a3 NOOP", session.send(:redact_imap, "a3 NOOP")
+  end
+
+  # ==========================================================================
+  # Class 6: store failure text (information disclosure)
+  # ==========================================================================
+
+  # A store whose write paths raise the way the Active Record backend does
+  # when the database rejects a row: Store::Base#db turns the exception
+  # into { error: "Class: message", code: :internal } - text naming the
+  # adapter, the table and the SQL.
+  class FailingStore < MailOnRails::Imap::Store::Memory
+    INTERNAL = { error: "ActiveRecord::StatementInvalid: PG::DatetimeFieldOverflow: ERROR: date/time field value " \
+                        "out of range: SELECT 1 FROM mail_on_rails_email_messages", code: :internal }.freeze
+
+    attr_accessor :failing
+
+    %i[create_mailbox delete_mailbox rename_mailbox append copy move].each do |name|
+      define_method(name) { |*args| failing ? INTERNAL.dup : super(*args) }
+    end
+  end
+
+  test "store exception text never reaches the client" do
+    @store = FailingStore.new
+    @account_id = @store.add_account(email: EMAIL, password: PASSWORD)
+    @store.append(@account_id, "INBOX", "From: s@r.test\r\nSubject: k\r\n\r\nx\r\n", [], nil)
+    @store.failing = true
+    c = connect
+    command(c, "s0", "SELECT INBOX")
+    replies = {
+      "CREATE" => command(c, "f1", "CREATE Box"),
+      "DELETE" => command(c, "f2", "DELETE Sent"),
+      "RENAME" => command(c, "f3", "RENAME Sent Sent2"),
+      "APPEND" => append(c, "f4", "INBOX", "Subject: x\r\n\r\nbody\r\n", date: "01-Jan-999999999 00:00:00 +0000"),
+      "COPY" => command(c, "f5", "COPY 1 Sent"),
+      "MOVE" => command(c, "f6", "MOVE 1 Sent")
+    }
+    replies.each do |verb, reply|
+      assert_match(/\Af\d NO \[UNAVAILABLE\] #{verb} failed: temporary server error\r\n\z/, reply, verb)
+      refute_match(/ActiveRecord|PG::|SELECT|mail_on_rails_/, reply, verb)
+    end
+    assert_match(/\Af7 OK/, command(c, "f7", "NOOP"))
+  end
+
+  # ...while the store's own short reasons for the codes it defines still
+  # come through with their response codes.
+  test "known store failure codes keep their response codes" do
+    @store.append(@account_id, "INBOX", "From: s@r.test\r\nSubject: k\r\n\r\nx\r\n", [], nil)
+    c = connect
+    command(c, "s0", "SELECT INBOX")
+    assert_match(/\Ak1 NO \[TRYCREATE\] COPY failed: no such mailbox/, command(c, "k1", "COPY 1 Nope"))
+    assert_match(/\Ak2 NO \[ALREADYEXISTS\] CREATE failed: mailbox exists/, command(c, "k2", "CREATE Sent"))
+    assert_match(/\Ak3 NO \[NONEXISTENT\] DELETE failed: no such mailbox/, command(c, "k3", "DELETE Nope"))
   end
 end

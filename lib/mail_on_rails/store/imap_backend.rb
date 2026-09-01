@@ -3,6 +3,7 @@
 require "active_support/key_generator"
 require "mail_on_rails/clamav_scanner"
 require "mail_on_rails/scram"
+require "mail_on_rails/imap/store/memory" # Imap::Store.missing_uid_ranges
 
 module MailOnRails
   module Store
@@ -10,6 +11,11 @@ module MailOnRails
     # the IMAP server is allowed to do, on Active Record, in the same
     # process as the unified mail server (see docs/store_contract.md).
     class ImapBackend < Base
+      # Rows loaded per query inside COPY/MOVE: the IMAP session already
+      # batches what it asks for, but a store call must not load a whole
+      # uid list of raw messages either.
+      COPY_BATCH = 100
+
       # Quarantine holds flagged malware and is reachable only through the
       # web review UI, never over IMAP: it is hidden from LIST and every
       # by-name operation resolves it to "no such mailbox", so a client can
@@ -248,7 +254,7 @@ module MailOnRails
             # One transaction so an over-quota refusal midway leaves
             # nothing half-copied.
             EmailMessage.transaction do
-              EmailMessage.where(mailbox_id: mailbox_id, uid: uids).order(:uid).each do |m|
+              each_message_batch(mailbox_id, uids) do |m|
                 # Same bytes, same verdict - no rescan on copy.
                 copied = EmailMessage.deliver_raw(dest, m.raw, flags: m.flags, internal_date: m.internal_date,
                                                   scan_status: m.scan_status, virus_name: m.virus_name)
@@ -275,7 +281,9 @@ module MailOnRails
       # QRESYNC: uids expunged after since_modseq. complete: false means
       # tombstone history was pruned past since_modseq; the fallback set
       # (every uid ever allocated but no longer present) is still correct,
-      # just larger, because uids are never reused.
+      # just larger, because uids are never reused - so it is reported as
+      # [lo, hi] gaps under :ranges, sized by the mailbox rather than by
+      # uid_next (see Imap::Store.missing_uid_ranges).
       def expunged_since(mailbox_id, since_modseq)
         db do
           mailbox = Mailbox.find(mailbox_id)
@@ -285,9 +293,28 @@ module MailOnRails
                                   .distinct.order(:uid).pluck(:uid)
             { uids: uids, complete: true }
           else
-            present = EmailMessage.where(mailbox_id: mailbox_id).pluck(:uid)
-            { uids: (1...mailbox.uid_next).to_a - present, complete: false }
+            present = EmailMessage.where(mailbox_id: mailbox_id).order(:uid).pluck(:uid)
+            { ranges: MailOnRails::Imap::Store.missing_uid_ranges(present, mailbox.uid_next), complete: false }
           end
+        end
+      end
+
+      # FROM/TO/SUBJECT search pushdown (see the store contract), from the
+      # columns deliver_raw extracts at delivery: substring, case-
+      # insensitive, every word of a multi-word query required (the
+      # like_search semantics TEXT/BODY already accept on non-PostgreSQL
+      # adapters). The address columns hold addresses, not display names,
+      # so FROM/TO match the address part - the trade-off that keeps a
+      # header search from shipping every raw message to the session.
+      HEADER_SEARCH_COLUMNS = { "subject" => "subject", "from" => "from_address", "to" => "to_addresses" }.freeze
+
+      def search_header(mailbox_id, field, query)
+        column = HEADER_SEARCH_COLUMNS[field.to_s.downcase]
+        return { uids: [] } unless column
+
+        db do
+          relation = EmailMessage.where(mailbox_id: mailbox_id).merge(EmailMessage.like_search(query, columns: [ column ]))
+          { uids: relation.order(:uid).pluck(:uid) }
         end
       end
 
@@ -333,7 +360,7 @@ module MailOnRails
           src_uids = []
           dest_uids = []
           EmailMessage.transaction do
-            EmailMessage.where(mailbox_id: mailbox_id, uid: uids).order(:uid).each do |m|
+            each_message_batch(mailbox_id, uids) do |m|
               # Same bytes, same verdicts - no rescan on move (see move_to!).
               copied = m.move_to!(dest)
               src_uids << m.uid
@@ -345,6 +372,16 @@ module MailOnRails
       end
 
       private
+
+      # Yields the mailbox's messages for +uids+ in uid order, loading
+      # COPY_BATCH rows (raw bytes included) per query. The uid list is
+      # sliced in Ruby rather than find_each'd so the order stays by uid,
+      # not primary key.
+      def each_message_batch(mailbox_id, uids, &block)
+        uids.sort.each_slice(COPY_BATCH) do |slice|
+          EmailMessage.where(mailbox_id: mailbox_id, uid: slice).order(:uid).each(&block)
+        end
+      end
 
       # Resolves a mailbox by name for IMAP, treating Quarantine as
       # nonexistent so it can never be SELECTed, STATUSed, APPENDed, or

@@ -8,6 +8,23 @@ require_relative "../mime"
 module MailOnRails
   module Imap
     module Store
+      # The QRESYNC tombstone-floor fallback for any store (see
+      # expunged_since): every uid below uid_next that is not present, as
+      # ascending [lo, hi] gaps computed in one pass over the present uids
+      # (ascending) - never as the materialized (1...uid_next) range, which
+      # a mailbox with a large uid_next would turn into megabytes per
+      # SELECT.
+      def self.missing_uid_ranges(present, uid_next)
+        ranges = []
+        expect = 1
+        present.each do |uid|
+          ranges << [ expect, uid - 1 ] if uid > expect
+          expect = uid + 1
+        end
+        ranges << [ expect, uid_next - 1 ] if expect < uid_next
+        ranges
+      end
+
       # In-memory reference implementation of the IMAP side of the store
       # contract (docs/store_contract.md in the main mail_on_rails app repo),
       # with no Rails or database dependency. It exists so protocol behavior
@@ -258,7 +275,8 @@ module MailOnRails
         def fetch(mailbox_id, uids, with_raw)
           @lock.synchronize do
             mailbox = mailbox_by_id(mailbox_id)
-            messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
+            wanted = uids.to_set
+            messages = mailbox ? sorted(mailbox).select { |m| wanted.include?(m[:uid]) } : []
             entries = messages.map do |m|
               entry = { uid: m[:uid], flags: m[:flags].dup, internal_date: m[:internal_date].to_i,
                         size: m[:size], modseq: m[:modseq],
@@ -273,7 +291,8 @@ module MailOnRails
         def store_flags(mailbox_id, uids, mode, flags)
           @lock.synchronize do
             mailbox = mailbox_by_id(mailbox_id)
-            messages = mailbox ? sorted(mailbox).select { |m| uids.include?(m[:uid]) } : []
+            wanted = uids.to_set
+            messages = mailbox ? sorted(mailbox).select { |m| wanted.include?(m[:uid]) } : []
             updated = messages.map do |m|
               # Flags are case-insensitive atoms: adding "Custom1" to a
               # message flagged "custom1" is a no-op, and removing it
@@ -303,8 +322,9 @@ module MailOnRails
             mailbox = mailbox_by_id(mailbox_id)
             return { uids: [] } unless mailbox
 
+            wanted = uids&.to_set
             doomed, kept = mailbox[:messages].partition do |m|
-              m[:flags].include?("\\Deleted") && (uids.nil? || uids.include?(m[:uid]))
+              m[:flags].include?("\\Deleted") && (wanted.nil? || wanted.include?(m[:uid]))
             end
             mailbox[:messages] = kept
             removed = doomed.map { |m| m[:uid] }.sort
@@ -339,7 +359,8 @@ module MailOnRails
             dest = find_mailbox(account, dest_name)
             return { error: "no such mailbox", code: :notfound } unless dest
 
-            wanted = sorted(source).select { |m| uids.include?(m[:uid]) }
+            requested = uids.to_set
+            wanted = sorted(source).select { |m| requested.include?(m[:uid]) }
             if over_quota?(account, wanted.sum { |m| m[:size] })
               return { error: "#{account[:email]} is over its storage quota", code: :overquota }
             end
@@ -358,7 +379,9 @@ module MailOnRails
         # QRESYNC: uids expunged after since_modseq. complete: false means
         # tombstone history was pruned past since_modseq, so the answer
         # falls back to every uid ever allocated but no longer present
-        # (uids are never reused, so that set is correct, just larger).
+        # (uids are never reused, so that set is correct, just larger) -
+        # reported as [lo, hi] gaps under :ranges rather than a uid list,
+        # since that set is as large as uid_next, not the mailbox.
         def expunged_since(mailbox_id, since_modseq)
           @lock.synchronize do
             mailbox = mailbox_by_id(mailbox_id)
@@ -368,8 +391,8 @@ module MailOnRails
               uids = mailbox[:tombstones].filter_map { |uid, modseq| uid if modseq > since_modseq }
               { uids: uids.sort.uniq, complete: true }
             else
-              present = mailbox[:messages].map { |m| m[:uid] }
-              { uids: (1...mailbox[:uid_next]).to_a - present, complete: false }
+              present = sorted(mailbox).map { |m| m[:uid] }
+              { ranges: Store.missing_uid_ranges(present, mailbox[:uid_next]), complete: false }
             end
           end
         end
@@ -406,6 +429,25 @@ module MailOnRails
           end
         end
 
+        # FROM/TO/SUBJECT search pushdown (see the store contract): the
+        # production store answers from its indexed columns; this one
+        # keeps RFC 3501's exact semantics - case-insensitive substring of
+        # the unfolded header value(s) - as it does for search_text.
+        def search_header(mailbox_id, field, query)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            return { uids: [] } unless mailbox
+
+            name = field.to_s.downcase
+            needle = query.to_s.downcase
+            hits = sorted(mailbox).select do |m|
+              headers = Imap::Mime.parse_headers(Imap::Mime.split_header(m[:raw])[0])
+              headers[name].to_a.any? { |v| v.downcase.include?(needle) }
+            end
+            { uids: hits.map { |m| m[:uid] } }
+          end
+        end
+
         # Atomic copy+remove (RFC 6851 MOVE): the message never exists in
         # both mailboxes from an observer's point of view.
         def move(mailbox_id, uids, dest_name)
@@ -419,13 +461,15 @@ module MailOnRails
 
             src_uids = []
             dest_uids = []
-            moved = sorted(source).select { |m| uids.include?(m[:uid]) }
+            requested = uids.to_set
+            moved = sorted(source).select { |m| requested.include?(m[:uid]) }
             moved.each do |m|
               copied = deliver_raw(account, dest, m[:raw], flags: m[:flags].dup, internal_date: m[:internal_date])
               src_uids << m[:uid]
               dest_uids << copied[:uid]
             end
-            source[:messages] = source[:messages].reject { |m| src_uids.include?(m[:uid]) }
+            gone = src_uids.to_set
+            source[:messages] = source[:messages].reject { |m| gone.include?(m[:uid]) }
             add_tombstones(source, src_uids)
             { uid_validity: dest[:uid_validity], src_uids: src_uids, dest_uids: dest_uids }
           end
