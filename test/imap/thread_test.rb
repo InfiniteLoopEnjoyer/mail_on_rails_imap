@@ -114,7 +114,12 @@ class ThreadTest < Minitest::Test
     end
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     threads = session.send(:references_threads, entries)
-    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
+    # Linear render of a 20k-deep chain is a few seconds of pure object
+    # churn (slower on shared CI); the assert_equal below is the real
+    # correctness guarantee. This bound only has to separate linear from a
+    # quadratic/recursive regression (minutes, or a SystemStackError), so
+    # it is deliberately generous rather than a latency SLA.
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 30
     assert_equal "(#{(1..depth).to_a.join(" ")})", threads.join
 
     # Same depth through placeholders: every message references a chain of
