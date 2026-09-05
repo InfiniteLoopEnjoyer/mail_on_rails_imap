@@ -2,6 +2,7 @@
 
 require "active_support/key_generator"
 require "mail_on_rails/clamav_scanner"
+require "mail_on_rails/junk_feedback"
 require "mail_on_rails/scram"
 require "mail_on_rails/imap/store/memory" # Imap::Store.missing_uid_ranges
 
@@ -238,6 +239,10 @@ module MailOnRails
           rescue EmailMessage::OverQuota => e
             next { error: e.message, code: :overquota }
           end
+          # Some clients "move" with APPEND + \Deleted + EXPUNGE; an APPEND
+          # into Junk is the user's spam verdict either way. DB writes and
+          # an after-commit enqueue only - no network inside the db block.
+          MailOnRails::JunkFeedback.filed(message, from: nil, to: mailbox, source: "imap")
           { uid: message.uid, uid_validity: mailbox.uid_validity }
         end
       end
@@ -258,6 +263,10 @@ module MailOnRails
                 # Same bytes, same verdict - no rescan on copy.
                 copied = EmailMessage.deliver_raw(dest, m.raw, flags: m.flags, internal_date: m.internal_date,
                                                   scan_status: m.scan_status, virus_name: m.virus_name)
+                # Clients without MOVE emulate it as COPY + \Deleted +
+                # EXPUNGE, so a COPY across the Junk boundary is the same
+                # verdict a MOVE is (JunkFeedback decides which).
+                MailOnRails::JunkFeedback.filed(copied, from: source, to: dest, source: "imap")
                 src_uids << m.uid
                 dest_uids << copied.uid
               end
@@ -361,8 +370,10 @@ module MailOnRails
           dest_uids = []
           EmailMessage.transaction do
             each_message_batch(mailbox_id, uids) do |m|
-              # Same bytes, same verdicts - no rescan on move (see move_to!).
-              copied = m.move_to!(dest)
+              # Same bytes, same verdicts - no rescan on move (see move_to!,
+              # which also records a move across the Junk boundary as the
+              # user's spam verdict).
+              copied = m.move_to!(dest, source: "imap")
               src_uids << m.uid
               dest_uids << copied.uid
             end
