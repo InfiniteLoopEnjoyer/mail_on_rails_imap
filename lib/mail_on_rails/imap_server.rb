@@ -530,13 +530,20 @@ module MailOnRails
         # transcript). LOGIN/AUTHENTICATE arguments are redacted; a literal
         # password never reaches here anyway, it arrives as a [:lit, data] part.
         raw = parts.first.to_s.chomp
+        probe = Netserv::ProbeSignatures.detect(raw)
         redacted = redact_imap(raw)
         honeypot_transcript.inbound(redacted)
         trace("<=", redacted)
-        # Exploit-probe payloads are recognised and refused, never dispatched.
-        if (signature = Netserv::ProbeSignatures.match(raw))
-          trigger_honeypot("exploit_probe", signature: signature)
-          return tagged(raw[/\A\S+/] || "*", "BAD Unknown command")
+        # Exploit-probe payloads, foreign protocols (HTTP at a mail port, a
+        # TLS ClientHello on the plaintext port) and garbage bytes are
+        # recognised and refused, never dispatched. Whether the source is
+        # banned is HoneypotEvent#decide_response's call (observe-only
+        # unless the protocol_auto_ban setting is on). The tag is echoed
+        # only when it is printable ASCII - junk is not reflected.
+        if probe
+          trigger, signature = probe
+          trigger_honeypot(trigger, signature: signature)
+          return tagged(raw[/\A[\x21-\x7e]+/] || "*", "BAD Unknown command")
         end
 
         tokens = Lexer.new(parts).tokens

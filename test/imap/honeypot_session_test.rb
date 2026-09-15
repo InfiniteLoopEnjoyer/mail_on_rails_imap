@@ -106,4 +106,55 @@ class ImapHoneypotSessionTest < Minitest::Test
       command(client, "a1", "LOGOUT")
     end
   end
+
+  # An HTTP scanner's request line: the tag it "sends" is GET, so the BAD
+  # is tagged GET; recorded under its own trigger for protocol_auto_ban.
+  def test_http_request_at_the_imap_port_is_recorded_as_a_foreign_protocol
+    with_session do |client|
+      client.gets("\r\n")
+      assert_match(/\AGET BAD Unknown command\r\n\z/, command(client, "GET", "/ HTTP/1.1"))
+      command(client, "a2", "LOGOUT")
+    end
+
+    event = @store.honeypot_events.first
+    assert_equal "foreign_protocol", event[:trigger]
+    assert_equal "http_request", event[:signature]
+    assert_includes event[:transcript], "<= GET / HTTP/1.1"
+  end
+
+  # A scanner's binary blob carries no CRLF, so it reaches handle as one
+  # unterminated line at EOF. It is named, recorded, and the junk "tag" is
+  # not echoed back (before, the BAD carried the first run of bytes as its
+  # tag).
+  def test_tls_handshake_on_the_plaintext_port_is_recorded_and_not_reflected
+    with_session do |client|
+      client.gets("\r\n")
+      client.write("\x16\x03\x01\x00\xf4\x01\x00\x00\xf0\x03\x03\xff\xfe".b)
+      client.close_write
+      assert_equal "* BAD Unknown command\r\n", client.gets("\r\n")
+    end
+
+    event = @store.honeypot_events.first
+    assert_equal "foreign_protocol", event[:trigger]
+    assert_equal "tls_handshake", event[:signature]
+  end
+
+  def test_garbage_bytes_are_recorded_and_refused_and_the_session_survives
+    with_session do |client|
+      client.gets("\r\n")
+      # The junk "tag" is cut at its first non-printable byte, so the
+      # reply is tagged "b" - the test's tag-matching reader can't be used.
+      client.write("b\x00/{m<;s3gMm>.4 ;1\r\n")
+      assert_equal "b BAD Unknown command\r\n", client.gets("\r\n")
+      client.write("\xff\xfe junk\r\n".b)
+      assert_equal "* BAD Unknown command\r\n", client.gets("\r\n")
+      assert_match(/\Aa3 OK/, command(client, "a3", "NOOP"), "the session is still usable afterwards")
+      command(client, "a4", "LOGOUT")
+    end
+
+    assert_equal 1, @store.honeypot_events.size, "one event per session, not per line"
+    event = @store.honeypot_events.first
+    assert_equal "garbage", event[:trigger]
+    assert_equal "control_bytes", event[:signature]
+  end
 end
