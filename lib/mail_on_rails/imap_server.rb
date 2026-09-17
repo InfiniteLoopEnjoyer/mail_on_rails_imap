@@ -232,6 +232,9 @@ module MailOnRails
         @honeypot = false
         @honeypot_fired = false
         @honeypot_event_id = nil
+        # How far the session got, for idle_reason.
+        @commands_seen = 0
+        @auth_tried = false
       end
 
       # Honeypot hooks (Netserv::HoneypotSession). IMAP carries no HELO.
@@ -272,6 +275,23 @@ module MailOnRails
         else "authenticated"
         end
         { user: @username, state: state, tls: @tls }
+      end
+
+      # The shape of a session that did no mail work, nil for one that did
+      # (or tried to) - read once by Server#report_closed for the store's
+      # idle accounting (the idle_auto_ban setting). Kept out of live_info:
+      # that feeds the ops picture, and a field that moves with every
+      # command would make every command a dashboard write.
+      #
+      # Nothing in IMAP is open to a stranger, so the only work there is
+      # is logging in - and trying counts: a failed or refused login is
+      # auth_auto_ban's business, a honeypot hit protocol_auto_ban's. What
+      # is left is the connection that read the greeting, or CAPABILITY,
+      # perhaps the certificate, and went away.
+      def idle_reason
+        return nil if honeypot_fired? || @account_id || @auth_tried
+
+        @commands_seen.zero? ? "silent" : "no_auth"
       end
 
       # The transcript to persist for this session, or nil - the same
@@ -526,6 +546,7 @@ module MailOnRails
       # -- dispatch ----------------------------------------------------------
 
       def handle(parts)
+        @commands_seen += 1
         # The command line only (literals - message data - stay out of the
         # transcript). LOGIN/AUTHENTICATE arguments are redacted; a literal
         # password never reaches here anyway, it arrives as a [:lit, data] part.
@@ -691,6 +712,7 @@ module MailOnRails
       end
 
       def login(tag, args)
+        @auth_tried = true # before any refusal: see idle_reason
         return tagged(tag, "NO [PRIVACYREQUIRED] STARTTLS required before LOGIN") if tls_required?
         return if reject_reauth(tag, "LOGIN")
 
@@ -711,6 +733,7 @@ module MailOnRails
       end
 
       def authenticate(tag, args)
+        @auth_tried = true # before any refusal: see idle_reason
         return tagged(tag, "NO [PRIVACYREQUIRED] STARTTLS required before AUTHENTICATE") if tls_required?
         return if reject_reauth(tag, "AUTHENTICATE")
 
