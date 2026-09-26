@@ -637,6 +637,62 @@ module MailOnRails
             assert_equal [], store.search_header(-1, "subject", "quarterly")[:uids]
           end
 
+          # -- search_meta (optional size/date/id pushdown) ---------------------
+          # search_meta(mailbox_id, field, value) answers the SEARCH keys
+          # that compare one column: field is "size" (bytes),
+          # "internal_date" or "saved_date" (epoch seconds), "email_id" or
+          # "thread_id". value is an integer Range for the first three
+          # (inclusive, exclusive, beginless or endless) or the exact id
+          # string; the result is ascending uids, empty for an unknown
+          # mailbox or field. Stores without it skip these - the IMAP
+          # server pages every message's metadata instead.
+
+          def meta_seed
+            skip "store does not implement search_meta" unless store.respond_to?(:search_meta)
+            small = store.append(account_id, "INBOX", RAW_CRLF, [], 1_000_000)[:uid]
+            large = store.append(account_id, "INBOX", RAW_CRLF + ("x" * 500) + "\r\n", [], 2_000_000)[:uid]
+            [ store.select_mailbox(account_id, "INBOX")[:mailbox_id], small, large ]
+          end
+
+          def test_search_meta_size_ranges
+            mailbox_id, small, large = meta_seed
+            assert_equal [ large ], store.search_meta(mailbox_id, "size", (RAW_CRLF.bytesize + 1)..)[:uids]
+            assert_equal [ small ], store.search_meta(mailbox_id, "size", ...(RAW_CRLF.bytesize + 1))[:uids]
+            assert_equal [ small, large ], store.search_meta(mailbox_id, "size", 1..)[:uids]
+            assert_equal [], store.search_meta(mailbox_id, "size", ...1)[:uids]
+          end
+
+          def test_search_meta_internal_date_windows_are_epoch_seconds
+            mailbox_id, small, large = meta_seed
+            assert_equal [ large ], store.search_meta(mailbox_id, "internal_date", 1_500_000..)[:uids]
+            assert_equal [ small ], store.search_meta(mailbox_id, "internal_date", ...1_500_000)[:uids]
+            assert_equal [ small ], store.search_meta(mailbox_id, "internal_date", 1_000_000...1_000_001)[:uids]
+            assert_equal [], store.search_meta(mailbox_id, "internal_date", 1_000_001...2_000_000)[:uids]
+          end
+
+          def test_search_meta_saved_date_is_when_the_row_was_stored
+            mailbox_id, small, large = meta_seed
+            now = Time.now.to_i
+            assert_equal [ small, large ], store.search_meta(mailbox_id, "saved_date", (now - 60)..(now + 60))[:uids]
+            assert_equal [], store.search_meta(mailbox_id, "saved_date", ...(now - 60))[:uids]
+          end
+
+          def test_search_meta_matches_ids_exactly
+            mailbox_id, small, large = meta_seed
+            entry = store.fetch(mailbox_id, [ small ], false)[:messages].first
+            assert_equal [ small ], store.search_meta(mailbox_id, "email_id", entry[:email_id])[:uids]
+            assert_equal [ small ], store.search_meta(mailbox_id, "thread_id", entry[:thread_id])[:uids]
+            assert_equal [], store.search_meta(mailbox_id, "email_id", "Mnosuchid")[:uids]
+            # Exact, never a prefix or substring match.
+            assert_equal [], store.search_meta(mailbox_id, "email_id", entry[:email_id][0, 4])[:uids]
+          end
+
+          def test_search_meta_is_empty_for_an_unknown_mailbox_or_field
+            mailbox_id, = meta_seed
+            assert_equal [], store.search_meta(-1, "size", 0..)[:uids]
+            assert_equal [], store.search_meta(mailbox_id, "raw", 0..)[:uids]
+          end
+
           # -- quota (optional storage accounting) ------------------------------
           # A store that implements quota(account_id) reports used_bytes
           # (the sum of stored message sizes, CRLF-normalized) and

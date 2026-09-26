@@ -357,6 +357,31 @@ module MailOnRails
         end
       end
 
+      # Columns search_meta reads; the datetime ones take an epoch-second
+      # Range that is widened to Time so the adapter compares timestamps.
+      META_SEARCH_COLUMNS = {
+        "size" => :size, "internal_date" => :internal_date, "saved_date" => :created_at,
+        "email_id" => :email_object_id, "thread_id" => :thread_id
+      }.freeze
+      META_TIME_COLUMNS = %i[internal_date created_at].freeze
+
+      # Size/date/id search pushdown (see the store contract): one indexed
+      # query instead of the session paging every message's metadata to
+      # compare a column itself. +value+ is an integer Range (bytes, or
+      # epoch seconds, either end open) or an exact id string.
+      def search_meta(mailbox_id, field, value)
+        column = META_SEARCH_COLUMNS[field.to_s]
+        return { uids: [] } unless column
+
+        db do
+          if value.is_a?(Range) && META_TIME_COLUMNS.include?(column)
+            value = Range.new(value.begin && Time.zone.at(value.begin), value.end && Time.zone.at(value.end),
+                              value.exclude_end?)
+          end
+          { uids: EmailMessage.where(mailbox_id: mailbox_id, column => value).order(:uid).pluck(:uid) }
+        end
+      end
+
       # RFC 6851 MOVE as one transaction: copy into the destination and
       # remove the source rows together, so a failure leaves the message
       # in exactly one mailbox.

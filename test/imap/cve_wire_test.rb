@@ -305,6 +305,42 @@ class CveWireTest < Minitest::Test
     assert_match(/^t\\1 OK/, reply)
   end
 
+  # A rejected token is reflected in the BAD text ("Unknown FETCH item
+  # X"). Any argument may be a literal, so it can carry CRLF: the reply
+  # must still be a single tagged line, the injected text flattened to
+  # printable ASCII. Every site that echoes a client token is probed.
+  test "a literal token carrying CRLF cannot split a BAD reply" do
+    @store.append(@account_id, "INBOX", "From: s@r.test\r\nSubject: k\r\n\r\nx\r\n", [], nil)
+    c = connect
+    command(c, "i0", "SELECT INBOX")
+    inject = "INJECT\r\nZZZ EVIL"
+    probes = {
+      "f1" => "FETCH 1 {#{inject.bytesize}+}\r\n#{inject}",
+      "f2" => "STORE 1 {#{inject.bytesize}+}\r\n#{inject} (\\Seen)",
+      "f3" => "SEARCH {#{inject.bytesize}+}\r\n#{inject}",
+      "f4" => "SEARCH SINCE {#{inject.bytesize}+}\r\n#{inject}",
+      "f5" => "SEARCH OLDER {#{inject.bytesize}+}\r\n#{inject}",
+      "f6" => "SEARCH RETURN ({#{inject.bytesize}+}\r\n#{inject}) ALL",
+      "f7" => "STATUS INBOX ({#{inject.bytesize}+}\r\n#{inject})",
+      "f8" => "LIST ({#{inject.bytesize}+}\r\n#{inject}) \"\" *",
+      "f9" => "LIST \"\" * RETURN ({#{inject.bytesize}+}\r\n#{inject})",
+      "f10" => "SORT ({#{inject.bytesize}+}\r\n#{inject}) UTF-8 ALL",
+      "f11" => "THREAD {#{inject.bytesize}+}\r\n#{inject} UTF-8 ALL",
+      "f12" => "{#{inject.bytesize}+}\r\n#{inject}"
+    }
+    probes.each do |tag, line|
+      c.write("#{tag} #{line}\r\n")
+      reply = read_until_tagged(c, tag)
+      assert_match(/\A#{tag} BAD [^\r\n]*\r\n\z/, reply, "#{tag}: #{reply.inspect}")
+      refute_match(/\nZZZ EVIL/, reply, "#{tag}: the injected line must not survive")
+    end
+    # The tag itself may be a literal.
+    c.write("{6+}\r\nt1\r\nt2 NOOP\r\n")
+    reply = c.gets("\r\n")
+    assert_match(/\At1\?\?t2 (OK|BAD)[^\r\n]*\r\n\z/, reply)
+    assert_match(/\Ai9 OK/, command(c, "i9", "NOOP"))
+  end
+
   # Credentials are redacted from the transcript even when the command
   # line carries leading whitespace (which the lexer tolerates).
   test "login and authenticate lines are redacted regardless of leading whitespace" do

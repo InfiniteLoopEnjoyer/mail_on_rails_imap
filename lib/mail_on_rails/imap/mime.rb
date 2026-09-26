@@ -50,7 +50,7 @@ module MailOnRails
 
         if part.multipart? && params["boundary"]
           budget[:bytes] -= body.bytesize # the split's own copy
-          chunks = split_multipart(body, params["boundary"]).first(budget[:parts])
+          chunks = split_multipart(body, params["boundary"], budget[:parts])
           budget[:parts] -= chunks.size
           part.children = chunks.map { |chunk| parse(chunk, depth: depth + 1, budget: budget) }
           part.children = nil if part.children.empty?
@@ -109,16 +109,30 @@ module MailOnRails
         [ "text", "plain", {} ]
       end
 
-      def split_multipart(body, boundary)
+      # Splits a multipart body at its boundary lines into at most +limit+
+      # chunks (nil: unbounded). The limit is enforced while scanning, not
+      # by trimming afterwards: a body that is nothing but delimiter lines
+      # ("--b\r\n" repeated, a few MiB via APPEND or SMTP) would otherwise
+      # allocate a chunk string per line - hundreds of MB and seconds of
+      # CPU on every BODYSTRUCTURE - before parse dropped the excess.
+      # Everything past the last allowed delimiter is discarded, which is
+      # what trimming did.
+      def split_multipart(body, boundary, limit = nil)
         delim = "--#{boundary}"
+        close = "#{delim}--"
         chunks = []
         current = nil
         body.each_line do |line|
-          marker = line.chomp.rstrip
+          # Only a line that opens with the delimiter can be one; the
+          # trailing-whitespace strip is skipped for every other line.
+          marker = line.start_with?(delim) ? line.chomp.rstrip : nil
           if marker == delim
             chunks << current if current
+            current = nil
+            break if limit && chunks.size >= limit
+
             current = +"".b
-          elsif marker == "#{delim}--"
+          elsif marker == close
             chunks << current if current
             current = nil
           elsif current

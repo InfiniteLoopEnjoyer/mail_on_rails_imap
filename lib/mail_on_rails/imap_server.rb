@@ -8,6 +8,7 @@ require "mail_on_rails/scram"
 require "mail_on_rails/settings"
 require "mail_on_rails/netserv/config"
 require "mail_on_rails/netserv/server"
+require "mail_on_rails/netserv/account_limiter"
 require "mail_on_rails/imap/session_helpers"
 require "mail_on_rails/imap/utf7"
 require "mail_on_rails/imap/version"
@@ -196,6 +197,18 @@ module MailOnRails
       # answering whether this peer's IP is currently locked out.
       attr_writer :on_auth_failure, :auth_locked
 
+      # Concurrent authenticated sessions per account, shared by every
+      # session in the process (all listeners). The per-IP caps are blind
+      # to one stolen password worked from many addresses, each under its
+      # own per-IP allowance; this bounds the identity instead. Read
+      # through the settings schema per login, so a change applies to the
+      # next LOGIN without a restart.
+      @account_sessions = Netserv::AccountLimiter.new(-> { Settings[:imap_max_sessions_per_account] })
+
+      class << self
+        attr_reader :account_sessions
+      end
+
       def initialize(socket, store, spec, tls_ctx)
         @socket = socket
         @store = store
@@ -207,6 +220,7 @@ module MailOnRails
         @close_reason = nil
         @protocol_errors = 0
         @account_id = nil
+        @account_session_key = nil
         @username = nil
         @idling = false
         @on_auth_failure = nil
@@ -342,6 +356,7 @@ module MailOnRails
         @close_reason = "session_error"
         @store.log(:error, "IMAP session error: #{e.class}: #{e.message} #{e.backtrace&.first}")
       ensure
+        release_account_session
         begin
           @socket.close
         rescue StandardError
@@ -523,6 +538,28 @@ module MailOnRails
         @store.log(:info, "IMAP #{direction} #{flat} (#{peer_ip})")
       end
 
+      # A client token reflected in a BAD reply (an unknown FETCH item,
+      # search key, STATUS attribute, ...). Any argument may arrive as a
+      # literal, so the token can carry CR/LF and other control bytes that
+      # would split the reply into forged response lines on the client's
+      # own stream: it is reduced to printable ASCII and cut short first.
+      ECHO_TOKEN_MAX = 64
+
+      def echo_token(token)
+        token.to_s.b.gsub(/[^\x20-\x7e]/n, "?")[0, ECHO_TOKEN_MAX]
+      end
+
+      # Same reduction for a username on a log line: SASL usernames are
+      # base64-decoded client bytes, so "\n[mail_on_rails] ..." in one
+      # would otherwise forge a log entry. Unbounded length is not a
+      # concern for the log, but the reflected part is still cut short.
+      def log_user(user)
+        user = user.to_s
+        return "(empty)" if user.empty?
+
+        user.scrub.gsub(/[^[:graph:]]/, "?")[0, 80]
+      end
+
       # Redacts credentials from a command line before it enters the honeypot
       # transcript - the same no-password policy the SMTP tracer keeps. LOGIN's
       # user and password both go (parsing a quoted/literal username safely is
@@ -574,6 +611,9 @@ module MailOnRails
           @protocol_errors += 1
           return untagged("BAD Empty command")
         end
+        # The tag is echoed on every reply to this command; sent as a
+        # literal it could carry CR/LF too (see echo_token).
+        tag = echo_token(tag)
 
         uid_mode = false
         if name.casecmp?("UID") && tokens.first.is_a?(String)
@@ -630,7 +670,7 @@ module MailOnRails
         when "SORT"         then require_selected(tag) { sort(tag, args, uid_mode) }
         when "THREAD"       then require_selected(tag) { thread(tag, args, uid_mode) }
         when "GETQUOTA", "GETQUOTAROOT", "SETQUOTA"
-          return tagged(tag, "BAD Unknown command #{name}") unless @store.respond_to?(:quota)
+          return tagged(tag, "BAD Unknown command #{echo_token(name)}") unless @store.respond_to?(:quota)
 
           require_auth(tag) do
             case name
@@ -642,7 +682,7 @@ module MailOnRails
         when "IDLE"         then require_auth(tag) { idle(tag) }
         else
           @protocol_errors += 1
-          tagged tag, "BAD Unknown command #{name}"
+          tagged tag, "BAD Unknown command #{echo_token(name)}"
         end
       end
 
@@ -699,6 +739,7 @@ module MailOnRails
         @tls = true
         set_timeout(session_timeout)
         # Discard pre-TLS session state; the client re-authenticates.
+        release_account_session
         @account_id = nil
         @username = nil
         @selected = nil
@@ -869,6 +910,7 @@ module MailOnRails
         verifier = "v=#{[ Scram.server_signature(server_key, auth_message) ].pack("m0")}"
         empty = sasl_challenge(tag, [ verifier ].pack("m0")) { return } or return
         return tagged(tag, "BAD Unexpected final client response") unless empty.empty?
+        return if account_session_refusal(tag, creds[:account_id], creds[:email])
 
         authenticated(creds[:account_id], creds[:email])
         @store.log(:info, "IMAP login #{creds[:email]} (#{peer_ip}, SCRAM#{"-PLUS" if plus})")
@@ -899,7 +941,7 @@ module MailOnRails
       def auth_failure(tag, user)
         @auth_attempts += 1
         @on_auth_failure&.call
-        @store.log(:warn, "IMAP auth failed for #{user.to_s.empty? ? "(empty)" : user} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
+        @store.log(:warn, "IMAP auth failed for #{log_user(user)} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
         tagged tag, "NO [AUTHENTICATIONFAILED] Invalid credentials"
         disconnect_if_attempts_exhausted
       end
@@ -912,7 +954,7 @@ module MailOnRails
       # throttled client is hung up on rather than left spinning.
       def auth_throttled(tag, verb, user, retry_after)
         @auth_attempts += 1
-        @store.log(:warn, "IMAP #{verb} throttled for #{user.to_s.empty? ? "(empty)" : user} " \
+        @store.log(:warn, "IMAP #{verb} throttled for #{log_user(user)} " \
                           "(#{peer_ip}), #{retry_after}s remaining")
         tagged tag, "NO [UNAVAILABLE] Too many authentication failures, try again later"
         disconnect_if_attempts_exhausted
@@ -929,7 +971,7 @@ module MailOnRails
         return false unless @auth_locked&.call
 
         @auth_attempts += 1
-        @store.log(:warn, "IMAP #{verb} refused for #{user.to_s.empty? ? "(empty)" : user}: IP locked out (#{peer_ip})")
+        @store.log(:warn, "IMAP #{verb} refused for #{log_user(user)}: IP locked out (#{peer_ip})")
         tagged tag, "NO [UNAVAILABLE] Too many authentication failures, try again later"
         disconnect_if_attempts_exhausted
         true
@@ -959,6 +1001,8 @@ module MailOnRails
 
         result = @store.authenticate(user.to_s, pass.to_s, ip: throttle_ip)
         if result[:account_id]
+          return if account_session_refusal(tag, result[:account_id], result[:email])
+
           authenticated(result[:account_id], result[:email])
           @store.log(:info, "IMAP login #{result[:email]} (#{peer_ip})")
           # A login against a canary can only be an attacker: record it and ban
@@ -980,6 +1024,30 @@ module MailOnRails
         @account_id = account_id
         @username = email
         set_timeout(session_timeout)
+      end
+
+      # The credentials were right but the account already holds its full
+      # allowance of sessions in this process: refuse this one without
+      # counting it as an authentication failure (nothing was guessed).
+      # RFC 5530 LIMIT tells the client it hit a server bound, not a
+      # credential problem, so it retries rather than re-prompting. On
+      # success the slot is held until the session ends (release_account_session).
+      def account_session_refusal(tag, account_id, email)
+        if self.class.account_sessions.acquire(account_id, limit: @spec[:max_sessions_per_account])
+          @account_session_key = account_id
+          return false
+        end
+
+        @store.log(:warn, "IMAP login refused for #{email}: too many simultaneous sessions (#{peer_ip})")
+        tagged tag, "NO [LIMIT] Too many simultaneous sessions for this account"
+        true
+      end
+
+      def release_account_session
+        return unless @account_session_key
+
+        self.class.account_sessions.release(@account_session_key)
+        @account_session_key = nil
       end
 
       # A store error during authentication means the app is unreachable,
@@ -1036,7 +1104,7 @@ module MailOnRails
           until args.first == :rparen
             option = args.shift
             unless option.is_a?(String) && option.casecmp?("SPECIAL-USE")
-              return tagged(tag, "BAD Unknown LIST selection option #{option}")
+              return tagged(tag, "BAD Unknown LIST selection option #{echo_token(option)}")
             end
 
             special_only = true
@@ -1101,10 +1169,10 @@ module MailOnRails
             args.shift
             return "STATUS expects at least one attribute" if items.empty?
             if (unknown = items.find { |i| !STATUS_ATTRS.include?(i) })
-              return "Unknown STATUS attribute #{unknown}"
+              return "Unknown STATUS attribute #{echo_token(unknown)}"
             end
           else
-            return "Unknown LIST RETURN option #{option}"
+            return "Unknown LIST RETURN option #{echo_token(option)}"
           end
         end
         items
@@ -1298,7 +1366,7 @@ module MailOnRails
         items = args.select { |a| a.is_a?(String) }.map(&:upcase)
         return tagged(tag, "BAD STATUS expects at least one attribute") if items.empty?
         if (unknown = items.find { |i| !STATUS_ATTRS.include?(i) })
-          return tagged(tag, "BAD Unknown STATUS attribute #{unknown}")
+          return tagged(tag, "BAD Unknown STATUS attribute #{echo_token(unknown)}")
         end
 
         return tagged(tag, "NO [NONEXISTENT] STATUS failed: no such mailbox") unless emit_status(name, items)
@@ -1695,7 +1763,7 @@ module MailOnRails
         items << "UID" if uid_mode && items.none? { |i| i.casecmp?("UID") }
         return tagged(tag, "BAD FETCH expects data items") if items.empty?
         if (bad = items.find { |i| !valid_fetch_item?(i) })
-          return tagged(tag, "BAD Unknown FETCH item #{bad}")
+          return tagged(tag, "BAD Unknown FETCH item #{echo_token(bad)}")
         end
 
         @condstore = true if changedsince || items.any? { |i| i.casecmp?("MODSEQ") }
@@ -1925,7 +1993,7 @@ module MailOnRails
         return tagged(tag, "NO Mailbox is read-only") if @read_only
 
         m = item.match(/\A([+-]?)FLAGS(\.SILENT)?\z/i)
-        return tagged(tag, "BAD Unknown STORE item #{item}") unless m
+        return tagged(tag, "BAD Unknown STORE item #{echo_token(item)}") unless m
 
         mode = m[1].empty? ? "=" : m[1]
         silent = !m[2].nil?
@@ -2136,7 +2204,7 @@ module MailOnRails
             criteria << [ name, reverse ]
             reverse = false
           else
-            return "Unknown SORT criterion #{name}"
+            return "Unknown SORT criterion #{echo_token(name)}"
           end
         end
         return "SORT expects at least one criterion" if criteria.empty?
@@ -2212,7 +2280,7 @@ module MailOnRails
       # like SEARCH, then arranges the matches into conversation trees.
       def thread(tag, args, uid_mode)
         algorithm = args.shift.to_s.upcase
-        return tagged(tag, "BAD Unknown THREAD algorithm #{algorithm}") unless THREAD_ALGORITHMS.include?(algorithm)
+        return tagged(tag, "BAD Unknown THREAD algorithm #{echo_token(algorithm)}") unless THREAD_ALGORITHMS.include?(algorithm)
 
         charset = args.shift
         unless charset.is_a?(String) && SEARCH_CHARSETS.any? { |c| charset.casecmp?(c) }
@@ -2544,7 +2612,7 @@ module MailOnRails
         end
         criteria.shift
         unknown = opts - ESEARCH_OPTIONS
-        raise SearchSyntaxError, "Unsupported SEARCH RETURN option #{unknown.first}" if unknown.any?
+        raise SearchSyntaxError, "Unsupported SEARCH RETURN option #{echo_token(unknown.first)}" if unknown.any?
 
         opts.empty? ? %w[ALL] : opts
       end
@@ -2617,11 +2685,11 @@ module MailOnRails
         when "UID"
           uids = resolve_set(toks.shift.to_s, true).map(&:last).to_set
           snapshot_key { |_seq, msg| uids.include?(msg[:uid]) }
-        when "LARGER"  then min = toks.shift.to_i; meta_key { |_seq, msg| msg[:size] > min }
-        when "SMALLER" then max = toks.shift.to_i; meta_key { |_seq, msg| msg[:size] < max }
-        when "SINCE"  then date_key(toks.shift) { |msg_day, day| msg_day >= day }
-        when "BEFORE" then date_key(toks.shift) { |msg_day, day| msg_day < day }
-        when "ON"     then date_key(toks.shift) { |msg_day, day| msg_day == day }
+        when "LARGER"  then column_key("size", (toks.shift.to_i + 1)..)
+        when "SMALLER" then column_key("size", (...toks.shift.to_i))
+        when "SINCE"  then date_key(toks.shift, :since)
+        when "BEFORE" then date_key(toks.shift, :before)
+        when "ON"     then date_key(toks.shift, :on)
         when "SENTSINCE"  then sent_date_key(toks.shift) { |msg_day, day| msg_day >= day }
         when "SENTBEFORE" then sent_date_key(toks.shift) { |msg_day, day| msg_day < day }
         when "SENTON"     then sent_date_key(toks.shift) { |msg_day, day| msg_day == day }
@@ -2638,17 +2706,13 @@ module MailOnRails
         when "BODY"
           # Unlike TEXT, BODY matches the body only, never the header.
           content_key(toks.shift.to_s, "body")
-        when "OLDER"   then age_key(toks.shift) { |age, seconds| age >= seconds }
-        when "YOUNGER" then age_key(toks.shift) { |age, seconds| age <= seconds }
-        when "SAVEDBEFORE" then saved_date_key(toks.shift) { |saved, day| saved < day }
-        when "SAVEDON"     then saved_date_key(toks.shift) { |saved, day| saved == day }
-        when "SAVEDSINCE"  then saved_date_key(toks.shift) { |saved, day| saved >= day }
-        when "EMAILID"
-          value = toks.shift.to_s
-          meta_key { |_seq, msg| msg[:email_id] == value }
-        when "THREADID"
-          value = toks.shift.to_s
-          meta_key { |_seq, msg| msg[:thread_id] == value }
+        when "OLDER"   then age_key(toks.shift, :older)
+        when "YOUNGER" then age_key(toks.shift, :younger)
+        when "SAVEDBEFORE" then saved_date_key(toks.shift, :before)
+        when "SAVEDON"     then saved_date_key(toks.shift, :on)
+        when "SAVEDSINCE"  then saved_date_key(toks.shift, :since)
+        when "EMAILID"  then column_key("email_id", toks.shift.to_s)
+        when "THREADID" then column_key("thread_id", toks.shift.to_s)
         when "MODSEQ"
           # Optional entry-name/entry-type prefix ("/flags/\Seen" all) is
           # accepted and ignored - flags share one modseq per message here.
@@ -2665,7 +2729,7 @@ module MailOnRails
           seqs = resolve_set(tok, false).map(&:first).to_set
           snapshot_key { |seq, _msg| seqs.include?(seq) }
         else
-          raise SearchSyntaxError, "Unknown search key #{tok.upcase}"
+          raise SearchSyntaxError, "Unknown search key #{echo_token(tok.upcase)}"
         end
       end
 
@@ -2694,9 +2758,43 @@ module MailOnRails
         snapshot_key { |_seq, msg| (@flags[msg[:uid]] || msg[:flags] || []).any? { |f| f.casecmp?(flag) } }
       end
 
-      def date_key(str, &compare)
-        day = parse_search_date(str)
-        meta_key { |_seq, msg| compare.call(Time.at(msg[:internal_date]).utc.to_date, day) }
+      # Size, date and id keys read one store column each. A store that
+      # offers search_meta (see the store contract) answers them with one
+      # query, so "SEARCH SINCE 1-Jan-1970" or "LARGER 0" over a large
+      # mailbox costs a query, not a metadata walk of every message in
+      # FETCH_META_BATCH batches - repeatable by anyone holding the
+      # account's password. Stores without it take the metadata pass with
+      # the same matcher applied per message. +value+ is an integer Range
+      # (bytes, or epoch seconds; either end open) or an exact id string.
+      def column_key(field, value)
+        matcher = value.is_a?(Range) ? ->(v) { !v.nil? && value.cover?(v) } : ->(v) { v == value }
+        unless @store.respond_to?(:search_meta)
+          symbol = field.to_sym
+          return meta_key { |_seq, msg| matcher.call(msg[symbol]) }
+        end
+
+        uids = nil
+        snapshot_key do |_seq, msg|
+          uids ||= (@store.search_meta(@selected[:mailbox_id], field, value)[:uids] || []).to_set
+          uids.include?(msg[:uid])
+        end
+      end
+
+      # The epoch-second window a day comparison covers; the day's
+      # boundaries are taken in +zone+ (:utc for INTERNALDATE, whose
+      # search keys compare UTC dates, :local for SAVEDATE).
+      def day_window(day, op, zone)
+        start, finish = [ day, day + 1 ].map { |d| zone == :utc ? Time.utc(d.year, d.month, d.day) : d.to_time }.map(&:to_i)
+        case op
+        when :before then ...start
+        when :on then start...finish
+        else start..
+        end
+      end
+
+      # BEFORE/ON/SINCE compare INTERNALDATE's UTC date (RFC 3501).
+      def date_key(str, op)
+        column_key("internal_date", day_window(parse_search_date(str), op, :utc))
       end
 
       # SENTBEFORE/SENTON/SENTSINCE compare against the Date: header
@@ -2719,25 +2817,26 @@ module MailOnRails
       def parse_search_date(str)
         Date.strptime(str.to_s, "%d-%b-%Y")
       rescue ArgumentError
-        raise SearchSyntaxError, "Invalid date #{str}"
+        raise SearchSyntaxError, "Invalid date #{echo_token(str)}"
       end
 
       # SAVEDBEFORE/SAVEDON/SAVEDSINCE (RFC 8514) compare the date the
       # message entered the mailbox, disregarding time and timezone.
-      def saved_date_key(str, &compare)
-        day = parse_search_date(str)
-        meta_key { |_seq, msg| msg[:saved_date] && compare.call(Time.at(msg[:saved_date]).to_date, day) }
+      def saved_date_key(str, op)
+        column_key("saved_date", day_window(parse_search_date(str), op, :local))
       end
 
       # RFC 5032 OLDER/YOUNGER: message age in seconds vs INTERNALDATE.
-      def age_key(str, &compare)
+      # OLDER n is an age of at least n seconds (INTERNALDATE <= now - n),
+      # YOUNGER n an age of at most n.
+      def age_key(str, op)
         seconds = begin
           Integer(str.to_s, 10)
         rescue ArgumentError
-          raise SearchSyntaxError, "Invalid interval #{str}"
+          raise SearchSyntaxError, "Invalid interval #{echo_token(str)}"
         end
-        now = Time.now.to_i
-        meta_key { |_seq, msg| compare.call(now - msg[:internal_date], seconds) }
+        cutoff = Time.now.to_i - seconds
+        column_key("internal_date", op == :older ? (..cutoff) : (cutoff..))
       end
 
       # Header fields the store can search from its own columns

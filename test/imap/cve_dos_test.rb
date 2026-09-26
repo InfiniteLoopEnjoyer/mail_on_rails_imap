@@ -348,6 +348,37 @@ class CveDosTest < Minitest::Test
     assert_operator part.children.size, :<=, Mime::MAX_PARTS, "child count is capped at MAX_PARTS"
   end
 
+  # The part cap must hold while splitting, not after: a body that is
+  # nothing but delimiter lines (10 MiB of "--b\r\n", deliverable by
+  # anyone over SMTP, re-parsed on every BODYSTRUCTURE) once allocated a
+  # chunk string per line - 1.5 s and +100 MB RSS per parse - before the
+  # excess was trimmed. Wall clock and resident-set growth are both
+  # asserted; the bounds are loose enough for a slow CI runner and far
+  # below the unbounded figures.
+  def test_all_delimiter_body_parses_without_materializing_every_chunk
+    body = "Content-Type: multipart/mixed; boundary=b\r\n\r\n" + ("--b\r\n" * (10 * 1024 * 1024 / 5))
+    GC.start
+    rss_before = resident_kb
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    part = Mime.parse(body)
+    structure = Mime.bodystructure(part, extended: true)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    grown_kb = rss_before && resident_kb && (resident_kb - rss_before)
+
+    assert_operator elapsed, :<, 2.0, "all-delimiter parse took #{elapsed.round(2)}s"
+    assert_operator grown_kb, :<, 40 * 1024, "all-delimiter parse grew RSS by #{grown_kb / 1024} MB" if grown_kb
+    assert_equal Mime::MAX_PARTS, part.children.size
+    assert_operator structure.bytesize, :<, 100_000
+  end
+
+  # VmRSS in kB from /proc (Linux); nil elsewhere, which skips the memory
+  # assertion but keeps the timing one.
+  def resident_kb
+    File.read("/proc/self/status")[/^VmRSS:\s+(\d+)/, 1]&.to_i
+  rescue SystemCallError
+    nil
+  end
+
   # End to end: APPEND a hundreds-deep multipart, then FETCH the structure
   # items real clients ask for. Each must complete promptly with the session
   # intact - no recursion blowup in BODYSTRUCTURE/ENVELOPE/BODY generation.

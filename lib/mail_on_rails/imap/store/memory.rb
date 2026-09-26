@@ -448,6 +448,30 @@ module MailOnRails
           end
         end
 
+        # Fields search_meta answers, mapped to the message record's own.
+        META_SEARCH_FIELDS = {
+          "size" => :size, "internal_date" => :internal_date, "saved_date" => :saved_date,
+          "email_id" => :email_id, "thread_id" => :thread_id
+        }.freeze
+
+        # Size/date/id search pushdown (see the store contract): the uids
+        # whose field falls in +value+ - an integer Range (bytes, or epoch
+        # seconds, either end open) or an exact id string - ascending.
+        def search_meta(mailbox_id, field, value)
+          @lock.synchronize do
+            mailbox = mailbox_by_id(mailbox_id)
+            key = META_SEARCH_FIELDS[field.to_s]
+            return { uids: [] } unless mailbox && key
+
+            hits = sorted(mailbox).select do |m|
+              actual = m[key]
+              actual = actual.to_i if actual.is_a?(Time)
+              value.is_a?(Range) ? !actual.nil? && value.cover?(actual) : actual == value
+            end
+            { uids: hits.map { |m| m[:uid] } }
+          end
+        end
+
         # Atomic copy+remove (RFC 6851 MOVE): the message never exists in
         # both mailboxes from an observer's point of view.
         def move(mailbox_id, uids, dest_name)

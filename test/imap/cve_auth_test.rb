@@ -210,6 +210,48 @@ class ImapCveAuthTest < Minitest::Test
     assert_match(/\* BYE Too many failed authentication attempts/, drain(client))
   end
 
+  # -- class: log forging via the username (CWE-117) -------------------------
+
+  # A memory store that keeps what the session logs.
+  class LoggingStore < MailOnRails::Imap::Store::Memory
+    attr_reader :logged
+
+    def initialize(*)
+      super
+      @logged = []
+    end
+
+    def log(level, message)
+      @logged << [ level, message ]
+      nil
+    end
+  end
+
+  # The "auth failed for <user>" line carries client bytes: a SASL PLAIN
+  # username is base64-decoded, and a LOGIN username may be a literal, so
+  # either can embed "\n[mail_on_rails] ..." and forge a log entry. The
+  # username must reach the log flattened to printable characters and cut
+  # short.
+  def test_a_username_with_newlines_cannot_forge_a_log_line
+    @store = LoggingStore.new
+    @account_id = @store.add_account(email: EMAIL, password: PASSWORD)
+    forged = "bob\n[mail_on_rails] forged"
+    client = connect(login: false)
+
+    token = [ "\0#{forged}\0wrong" ].pack("m0")
+    assert_match(/\Aa1 NO \[AUTHENTICATIONFAILED\]/, command(client, "a1", "AUTHENTICATE PLAIN #{token}"))
+    client.write("a2 LOGIN {#{forged.bytesize}+}\r\n#{forged} wrong\r\n")
+    assert_match(/\Aa2 NO \[AUTHENTICATIONFAILED\]/, read_until_tagged(client, "a2"))
+    long = "#{"u" * 200}@example.test"
+    assert_match(/\Aa3 NO \[AUTHENTICATIONFAILED\]/, command(client, "a3", "LOGIN #{long} wrong"))
+
+    failures = @store.logged.map(&:last).select { |m| m.include?("auth failed for") }
+    assert_equal 3, failures.size
+    failures.each { |m| refute_match(/[\r\n]/, m, m.inspect) }
+    assert_equal 2, failures.count { |m| m.include?("auth failed for bob?[mail_on_rails]?forged (") }
+    assert failures.none? { |m| m.include?(long) }, "an over-long username is cut short"
+  end
+
   private
 
   # Strips the leading "tag " so replies from different connections compare

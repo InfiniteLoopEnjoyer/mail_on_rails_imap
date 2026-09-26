@@ -14,13 +14,19 @@ class SearchPushdownTest < Minitest::Test
 
   # Memory store that records pushdown calls and every fetch.
   class ProbeStore < MailOnRails::Imap::Store::Memory
-    attr_reader :search_text_calls, :search_header_calls, :fetches
+    attr_reader :search_text_calls, :search_header_calls, :search_meta_calls, :fetches
 
     def initialize(...)
       super
       @search_text_calls = []
       @search_header_calls = []
+      @search_meta_calls = []
       @fetches = [] # [with_raw, uid count]
+    end
+
+    def search_meta(mailbox_id, field, value)
+      @search_meta_calls << [ field, value ]
+      super
     end
 
     def search_text(mailbox_id, query, scope)
@@ -42,10 +48,12 @@ class SearchPushdownTest < Minitest::Test
     def meta_fetches = @fetches.count { |with_raw, _n| !with_raw }
   end
 
-  # A memory store with neither pushdown method: the session's own scans.
-  class BareStore < MailOnRails::Imap::Store::Memory
+  # A memory store with no pushdown method: the session's own scans and
+  # metadata pass. It records fetches like ProbeStore.
+  class BareStore < ProbeStore
     undef_method :search_text
     undef_method :search_header
+    undef_method :search_meta
   end
 
   RAW = "From: fred@example.test\r\nSubject: afternoon meeting\r\n\r\nthe kumquat budget?\r\n"
@@ -159,9 +167,9 @@ class SearchPushdownTest < Minitest::Test
   end
 
   # Metadata keys fetch without raw bytes, and only for the messages the
-  # snapshot keys let through.
+  # snapshot keys let through - on a store without search_meta.
   test "metadata keys fetch metadata only, for snapshot survivors" do
-    swap_store(ProbeStore.new)
+    swap_store(BareStore.new)
     5.times { @store.append(@account_id, "INBOX", RAW, [], nil) }
     c = connect
     command(c, "s0", "SELECT INBOX")
@@ -169,6 +177,61 @@ class SearchPushdownTest < Minitest::Test
 
     assert_equal [ 2, 3 ], search_hits(c, "m1", "2:3 LARGER 10")
     assert_equal [ [ false, 2 ] ], @store.fetches, "one metadata fetch, for the two snapshot survivors"
+  end
+
+  # -- L2: size/date/id keys push down to search_meta ---------------------------
+
+  # With search_meta every column-comparing key is one store query and no
+  # fetch at all, however large the mailbox: "SEARCH SINCE 1-Jan-1970" or
+  # "LARGER 0" no longer pages the whole mailbox's metadata through the
+  # session, repeatably, for anyone holding the password.
+  test "size date and id keys push down to search_meta without fetching" do
+    swap_store(ProbeStore.new)
+    @store.append(@account_id, "INBOX", RAW, [], Time.utc(2020, 6, 15, 12).to_i)
+    @store.append(@account_id, "INBOX", RAW + ("x" * 200) + "\r\n", [], Time.utc(2021, 6, 15, 12).to_i)
+    c = connect
+    command(c, "s0", "SELECT INBOX")
+    email_id = command(c, "e0", "FETCH 1 (EMAILID)")[/EMAILID \(([^)]+)\)/, 1]
+    @store.fetches.clear
+
+    assert_equal [ 2 ], search_hits(c, "m1", "LARGER #{RAW.bytesize}")
+    assert_equal [ 1 ], search_hits(c, "m2", "SMALLER #{RAW.bytesize + 1}")
+    assert_equal [ 2 ], search_hits(c, "m3", "SINCE 1-Jan-2021")
+    assert_equal [ 1 ], search_hits(c, "m4", "BEFORE 1-Jan-2021")
+    assert_equal [ 1 ], search_hits(c, "m5", "ON 15-Jun-2020")
+    assert_equal [], search_hits(c, "m6", "ON 16-Jun-2020")
+    assert_equal [ 1, 2 ], search_hits(c, "m7", "OLDER 86400")
+    assert_equal [], search_hits(c, "m8", "YOUNGER 86400")
+    assert_equal [ 1, 2 ], search_hits(c, "m9", "SAVEDSINCE #{Date.today.prev_day.strftime("%d-%b-%Y")}")
+    assert_equal [], search_hits(c, "m10", "SAVEDBEFORE #{Date.today.prev_day.strftime("%d-%b-%Y")}")
+    assert_equal [ 1 ], search_hits(c, "m11", "EMAILID #{email_id}")
+    assert_equal [ 2 ], search_hits(c, "m12", "NOT EMAILID #{email_id}")
+    assert_equal [ 2 ], search_hits(c, "m13", "OR THREADID Tnosuchthread LARGER #{RAW.bytesize}")
+    assert_equal [ 1 ], search_hits(c, "m14", "1:1 SINCE 1-Jan-2020")
+
+    assert_equal %w[size size internal_date internal_date internal_date internal_date internal_date
+                    internal_date saved_date saved_date email_id email_id thread_id size internal_date],
+                 @store.search_meta_calls.map(&:first)
+    assert_empty @store.fetches, "column keys must not fetch anything"
+  end
+
+  # The metadata pass, for stores without search_meta, answers the same.
+  test "a store without search_meta compares metadata in the session" do
+    swap_store(BareStore.new)
+    @store.append(@account_id, "INBOX", RAW, [], Time.utc(2020, 6, 15, 12).to_i)
+    @store.append(@account_id, "INBOX", RAW + ("x" * 200) + "\r\n", [], Time.utc(2021, 6, 15, 12).to_i)
+    c = connect
+    command(c, "s0", "SELECT INBOX")
+
+    assert_equal [ 2 ], search_hits(c, "b1", "LARGER #{RAW.bytesize}")
+    assert_equal [ 1 ], search_hits(c, "b2", "SMALLER #{RAW.bytesize + 1}")
+    assert_equal [ 2 ], search_hits(c, "b3", "SINCE 1-Jan-2021")
+    assert_equal [ 1 ], search_hits(c, "b4", "ON 15-Jun-2020")
+    assert_equal [ 1, 2 ], search_hits(c, "b5", "OLDER 86400")
+    assert_equal [], search_hits(c, "b6", "YOUNGER 86400")
+    assert_equal [ 1, 2 ], search_hits(c, "b7", "SAVEDON #{Date.today.strftime("%d-%b-%Y")}")
+    assert_operator @store.meta_fetches, :>, 0
+    assert_equal 0, @store.raw_fetches
   end
 
   # Raw keys (CC, HEADER <other>, SENT*) come last, in bounded batches,
