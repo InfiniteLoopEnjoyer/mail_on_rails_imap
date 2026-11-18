@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "strscan"
+
 module MailOnRails
   module Imap
     # Minimal MIME parser and IMAP data-item formatter.
@@ -189,7 +191,9 @@ module MailOnRails
       # and must not read as Ruby's last-element index.
       def dig_part(part, numbers)
         numbers.inject(part) do |cur, n|
-          return nil unless cur && n.positive?
+          # No message has more than MAX_PARTS parts, and a number past a
+          # machine word is a RangeError as an array index.
+          return nil unless cur && n.positive? && n <= MAX_PARTS
 
           cur = cur.embedded if cur.message_rfc822?
           if cur.multipart?
@@ -201,7 +205,8 @@ module MailOnRails
       end
 
       def header_fields(header_block, names, negate: false)
-        wanted = names.map(&:downcase)
+        # A Set: the name list is the client's and is checked per header line.
+        wanted = names.to_set(&:downcase)
         out = +"".b
         keep = false
         header_block.each_line do |line|
@@ -282,15 +287,17 @@ module MailOnRails
         "(#{params.flat_map { |k, v| [ quote(k.upcase), quote(v.to_s) ] }.join(" ")})"
       end
 
+      # Sender and Reply-To default to From (RFC 3501 §7.4.2); the From
+      # list is built once and reused, not parsed again for each.
       def envelope(part)
         h = part.headers
-        from = h["from"]&.first
+        from = address_list(h["from"]&.first)
         "(#{[
           nstring(h["date"]&.first),
           nstring(h["subject"]&.first),
-          address_list(from),
-          address_list(h["sender"]&.first || from),
-          address_list(h["reply-to"]&.first || from),
+          from,
+          h["sender"] ? address_list(h["sender"].first) : from,
+          h["reply-to"] ? address_list(h["reply-to"].first) : from,
           address_list(h["to"]&.first),
           address_list(h["cc"]&.first),
           address_list(h["bcc"]&.first),
@@ -306,68 +313,142 @@ module MailOnRails
         "(#{addrs.map { |name, mbox, host| "(#{nstring(name)} NIL #{nstring(mbox)} #{nstring(host)})" }.join})"
       end
 
-      def parse_addresses(value)
-        return [] if value.nil? || value.strip.empty?
+      # How much of an address header ENVELOPE (and SORT FROM/TO/CC) will
+      # read. The header is whatever the sender wrote - SMTP bounds only
+      # the line length and the message - and megabytes of folded
+      # addresses used to cost seconds of CPU per FETCH and an 8x larger
+      # response. Mail to hundreds of visible recipients exists; the
+      # envelope then lists the first MAX_ADDRESSES, and a client that
+      # wants them all reads the header itself.
+      MAX_ADDRESS_HEADER_BYTES = 64 * 1024
+      MAX_ADDRESSES = 256
+      # One address with its display name. Longer "addresses" are not
+      # addresses, and are skipped rather than matched.
+      MAX_ADDRESS_BYTES = 1024
 
-        split_on_commas(value).filter_map do |token|
-          token = token.strip
-          if (m = token.match(/\A(?:"([^"]*)"|(.*?))\s*<([^>@\s]+)@([^>\s]+)>\z/m))
-            name = m[1] || m[2]
-            name = nil if name&.empty?
-            [ name, m[3], m[4] ]
-          elsif (m = token.match(/\A<?([^@\s<>]+)@([^\s<>]+?)>?\z/))
-            [ nil, m[1], m[2] ]
-          end
+      # [[display name or nil, mailbox, host], ...] for an address header.
+      # Linear in the (capped) header: one scanner pass to split, one
+      # anchored look at each piece.
+      def parse_addresses(value)
+        return [] if value.nil?
+
+        value = value.b
+        value = value.byteslice(0, MAX_ADDRESS_HEADER_BYTES) if value.bytesize > MAX_ADDRESS_HEADER_BYTES
+        return [] if value.strip.empty?
+
+        addresses = []
+        split_on_commas(value) do |token|
+          address = parse_address(token.strip)
+          addresses << address if address
+          break if addresses.length >= MAX_ADDRESSES
+        end
+        addresses
+      end
+
+      # "Display Name <local@host>" (the name optionally one quoted
+      # string), or a bare local@host with optional angle brackets.
+      def parse_address(token)
+        return nil if token.empty? || token.bytesize > MAX_ADDRESS_BYTES
+
+        if token.end_with?(">") && (found = angle_address(token))
+          name, open, at = found
+          [ (name unless name.empty?), token[(open + 1)...at], token[(at + 1)..-2] ]
+        elsif (m = token.match(/\A<?([^@\s<>]+)@([^\s<>]+?)>?\z/))
+          [ nil, m[1], m[2] ]
         end
       end
 
+      # [name, index of "<", index of "@"] for a token ending in
+      # "<local@host>", or nil. The angle address holds no ">" or
+      # whitespace, so it opens after the last of those; a quoted name
+      # directly in front of it is taken whole, otherwise the first "<"
+      # with a mailbox behind it is the one. (A lazy regexp found the same
+      # position by trying every prefix - quadratic in a long name with no
+      # address behind it.)
+      def angle_address(token)
+        floor = token.rindex(/[>\s]/, -2) || -1
+        if token.start_with?('"') && (close = token.index('"', 1))
+          open = token.index(/\S/, close + 1)
+          if open && open > floor && token[open] == "<" && (at = mailbox_end(token, open))
+            return [ token[1...close], open, at ]
+          end
+        end
+
+        open = token.index("<", floor + 1)
+        open = token.index("<", open + 1) while open && token[open + 1] == "@"
+        at = open && mailbox_end(token, open)
+        [ token[0...open].rstrip, open, at ] if at
+      end
+
+      # The "@" that ends a non-empty mailbox opening at +open+ and has a
+      # host after it.
+      def mailbox_end(token, open)
+        return nil if token[open + 1] == "@"
+
+        at = token.index("@", open + 1)
+        at if at && at < token.length - 2
+      end
+
+      # Yields the pieces of +value+ between top-level commas: a comma
+      # inside a quoted string or an angle address does not split.
       def split_on_commas(value)
-        tokens = []
-        current = +""
+        scanner = StringScanner.new(value)
+        start = 0
         quoted = false
         depth = 0
-        value.each_char do |ch|
-          case ch
-          when '"' then quoted = !quoted
-          when "<" then depth += 1 unless quoted
-          when ">" then depth -= 1 if depth.positive? && !quoted
-          when ","
-            unless quoted || depth.positive?
-              tokens << current
-              current = +""
-              next
-            end
+        while scanner.skip_until(/[",<>]/n)
+          case value.getbyte(scanner.pos - 1)
+          when 0x22 then quoted = !quoted
+          when 0x3c then depth += 1 unless quoted
+          when 0x3e then depth -= 1 if depth.positive? && !quoted
+          else
+            next if quoted || depth.positive?
+
+            yield value.byteslice(start, scanner.pos - 1 - start)
+            start = scanner.pos
           end
-          current << ch
         end
-        tokens << current
+        yield value.byteslice(start..).to_s
       end
 
       # -- PREVIEW (RFC 8970) --------------------------------------------------
 
       PREVIEW_MAX_CHARS = 200
       PREVIEW_MAX_OCTETS = 256
+      # How much of the (still transfer-encoded) text part a preview is
+      # made from: 200 characters of output never need the megabytes a
+      # body can run to decoded, tag-stripped and transcoded.
+      PREVIEW_SOURCE_BYTES = 64 * 1024
 
       # A short plain-text rendition of the message body for list views:
       # the first text part (multipart/alternative lists plain before html,
       # so plain wins), transfer-decoded, tags stripped for html, charset
       # coerced to UTF-8, whitespace collapsed, then capped at 200 chars /
-      # 256 octets per the RFC.
+      # 256 octets per the RFC. Always valid UTF-8, whatever the message
+      # declares or contains: everything up to the transcode works on
+      # bytes, and the transcode replaces what it cannot read.
       def preview(part)
         target = first_text_part(part)
         return "" unless target
 
-        text = decode_transfer_encoding(target)
-        text = text.gsub(/<[^>]*>/, " ") if target.subtype == "html"
-        charset = target.params["charset"] || "US-ASCII"
-        text = begin
-          text.force_encoding(charset).encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
-        rescue StandardError
-          text.dup.force_encoding(Encoding::UTF_8)
-        end
-        text = text.scrub.gsub(/\s+/, " ").strip[0, PREVIEW_MAX_CHARS]
+        text = decode_transfer_encoding(target, PREVIEW_SOURCE_BYTES)
+        text = text.gsub(/<[^>]*>/n, " ") if target.subtype == "html"
+        text = to_utf8(text, target.params["charset"] || "US-ASCII")
+        text = text.gsub(/\s+/, " ").strip[0, PREVIEW_MAX_CHARS]
         text = text[0..-2] while text.bytesize > PREVIEW_MAX_OCTETS
         text
+      end
+
+      # +bytes+ read as +charset+ and transcoded to UTF-8; as UTF-8 itself
+      # when the charset is unknown, unconvertible, or not a name at all
+      # (the header is the sender's). Invalid sequences become U+FFFD.
+      def to_utf8(bytes, charset)
+        text = begin
+          bytes.dup.force_encoding(charset).encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+        rescue StandardError
+          bytes.dup.force_encoding(Encoding::UTF_8)
+        end
+        text.scrub
       end
 
       def first_text_part(part)
@@ -383,12 +464,21 @@ module MailOnRails
         end
       end
 
-      def decode_transfer_encoding(part)
-        case part.encoding.downcase
-        when "base64" then part.body.unpack1("m").to_s
-        when "quoted-printable" then part.body.unpack1("M").to_s
-        else part.body.dup
-        end
+      # The first +limit+ octets of the part's body, transfer-decoded, as
+      # a binary string. Rebuilt from its bytes: unpack("M") can hand
+      # back a string flagged 7-bit that holds 8-bit bytes (a stray "="
+      # before one), and every later validity check - scrub included -
+      # trusts that flag, so the bad byte would surface only as an
+      # exception in whichever string method looked first.
+      def decode_transfer_encoding(part, limit)
+        body = part.body.byteslice(0, limit)
+        decoded =
+          case part.encoding.downcase
+          when "base64" then body.unpack1("m").to_s
+          when "quoted-printable" then body.unpack1("M").to_s
+          else body
+          end
+        decoded.unpack("C*").pack("C*")
       end
 
       # -- IMAP string encoding ------------------------------------------------

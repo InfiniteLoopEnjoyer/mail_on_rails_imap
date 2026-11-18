@@ -25,13 +25,13 @@ class PreauthLiteralTest < Minitest::Test
     @cleanup.each { |c| c.call rescue nil }
   end
 
-  def session
+  def session(spec: {})
     server = TCPServer.new("127.0.0.1", 0)
     client = TCPSocket.new("127.0.0.1", server.addr[1])
     client.timeout = 5
     session_socket = server.accept
     thread = Thread.new do
-      MailOnRails::ImapServer::Session.new(session_socket, @store, { tls: :implicit }, nil).run
+      MailOnRails::ImapServer::Session.new(session_socket, @store, { tls: :implicit }.merge(spec), nil).run
     end
     @cleanup << -> { client.close }
     @cleanup << -> { thread.join(5) }
@@ -119,9 +119,13 @@ class PreauthLiteralTest < Minitest::Test
   # could blow the session-thread stack - and SystemStackError is not
   # StandardError, so the thread died without even the error log line.
   # The refusal loop must keep the stack flat.
+  #
+  # The pre-auth command and error budgets would end this session after a
+  # few refusals (see PreauthBudgetTest), so they are lifted here: the
+  # point is the stack across thousands of them.
   test "a stream of refused literals does not grow the session stack" do
-    client = session
     rounds = 5_000
+    client = session(spec: { preauth_commands: rounds + 10, preauth_errors: rounds + 10 })
     # Pipelined in batches so neither side's socket buffer fills.
     rounds.times.each_slice(500) do |batch|
       batch.each { |i| client.write("t#{i} LOGIN #{EMAIL} {#{CAP + 1}}\r\n") }

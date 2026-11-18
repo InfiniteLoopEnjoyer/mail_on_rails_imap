@@ -348,4 +348,30 @@ class ScramSessionTest < Minitest::Test
     assert_match(/^flast NO \[AUTHENTICATIONFAILED\]/, final)
     assert_match(/\* BYE Too many failed authentication attempts/, drain(client))
   end
+
+  # L20 (audit 2026-11-17): by the time the client-final arrives the store
+  # has looked the account up and the salt has gone out. A reply that
+  # was not base64 used to be answered BAD and counted nowhere, so one
+  # connection could drive credential lookups without limit, none of them
+  # recorded as failures.
+  test "an undecodable client final is a counted, recorded failure" do
+    lookups = 0
+    recorded = 0
+    lookup = @store.method(:scram_credentials)
+    record = @store.method(:record_auth_failure)
+    @store.define_singleton_method(:scram_credentials) { |*a, **k| lookups += 1; lookup.call(*a, **k) }
+    @store.define_singleton_method(:record_auth_failure) { |*a, **k| recorded += 1; record.call(*a, **k) }
+    client = session
+    attempts = MailOnRails::ImapServer::MAX_AUTH_ATTEMPTS
+
+    attempts.times do |i|
+      begin_exchange(client, "g#{i}")
+      client.write(i.even? ? "!!!not-base64!!!\r\n" : "#{b64("c=#{b64("n,,")},r=x,p=!!!not-base64!!!")}\r\n")
+      assert_match(/\Ag#{i} BAD Invalid base64/, read_until_tagged(client, "g#{i}"))
+    end
+
+    assert_match(/\* BYE Too many failed authentication attempts/, drain(client))
+    assert_equal attempts, lookups, "no lookups past the attempt cap"
+    assert_equal attempts, recorded, "each one told to the store's throttle"
+  end
 end

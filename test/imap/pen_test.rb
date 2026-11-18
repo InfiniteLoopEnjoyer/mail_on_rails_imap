@@ -201,7 +201,9 @@ class ImapPenTest < Minitest::Test
     client.gets("\r\n")
     command(client, "a1", "LOGIN #{ALICE} #{PASSWORD}")
     assert_match(/\Aa2 NO/, command(client, "a2", %(SELECT "Bob-Secret")))
-    assert_match(/\Aa3 NO/, command(client, "a3", %(SELECT Bob-Secret")))
+    # The stray quote is an unterminated quoted string: refused as syntax.
+    assert_match(/\Aa3 BAD Unterminated quoted string/, command(client, "a3", %(SELECT Bob-Secret")))
+    assert_match(/\Aa4 NO/, command(client, "a4", "SELECT Bob-Secret"))
   end
 
   def test_oversize_literal_append_is_refused_and_session_stays_usable

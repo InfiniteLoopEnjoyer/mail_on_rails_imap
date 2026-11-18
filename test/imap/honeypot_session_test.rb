@@ -65,6 +65,135 @@ class ImapHoneypotSessionTest < Minitest::Test
     assert_includes event[:transcript], "FETCH 1 (BODY[])"
   end
 
+  # M6 (audit 2026-11-17): a canary session used to be an ordinary
+  # full-privilege session for up to 24 h - whoever guessed the decoy's
+  # password could store unlimited mail, and file it into and out of Junk
+  # to train the server-wide spam classifier. It is now look-only: every
+  # mailbox opens read-only, every write is refused the way a locked or
+  # full account refuses it, and nothing in the store changes.
+  def test_canary_session_can_look_but_not_change_anything
+    @store.create_mailbox(@canary_id, "Archive")
+    before = canary_state
+
+    with_session do |client|
+      client.gets("\r\n")
+      assert_match(/\Aa1 OK/, command(client, "a1", "LOGIN #{CANARY} #{PASSWORD}"))
+
+      select = command(client, "s1", "SELECT INBOX")
+      assert_match(/^\* 1 EXISTS/, select)
+      assert_match(/^s1 OK \[READ-ONLY\] SELECT completed/, select)
+
+      # Looking works, and leaves no trace: BODY[] would set \Seen.
+      assert_includes command(client, "f1", "FETCH 1 (BODY[])"), "lure body"
+      refute_match(/Seen/, command(client, "f2", "FETCH 1 (FLAGS)"))
+      assert_match(/^\* SEARCH 1\r\n/, command(client, "f3", "SEARCH TEXT lure"))
+      assert_match(/^\* LIST .* "Archive"/, command(client, "f4", %(LIST "" "*")))
+      assert_match(/^f5 OK/, command(client, "f5", "STATUS Archive (MESSAGES)"))
+
+      {
+        "STORE 1 +FLAGS (\\Deleted)" => /NO Mailbox is read-only/,
+        "EXPUNGE" => /NO Mailbox is read-only/,
+        "UID EXPUNGE 1" => /NO Mailbox is read-only/,
+        "MOVE 1 Junk" => /NO Mailbox is read-only/,
+        "COPY 1 Junk" => /NO \[OVERQUOTA\] COPY failed: quota exceeded/,
+        "UID COPY 1 Archive" => /NO \[OVERQUOTA\]/,
+        "CREATE Loot" => /NO \[NOPERM\] CREATE failed: permission denied/,
+        "DELETE Archive" => /NO \[NOPERM\]/,
+        "RENAME Archive Elsewhere" => /NO \[NOPERM\]/,
+        "RENAME INBOX Elsewhere" => /NO \[NOPERM\]/
+      }.each_with_index do |(line, expected), i|
+        assert_match(/\Aw#{i} #{expected.source}/, command(client, "w#{i}", line), line)
+      end
+
+      # APPEND, both literal forms: the message is taken off the wire (the
+      # stream stays framed) and thrown away.
+      client.write("p1 APPEND Junk {#{RAW.bytesize}+}\r\n#{RAW}\r\n")
+      assert_match(/\Ap1 NO \[OVERQUOTA\] APPEND failed: quota exceeded/, read_until_tagged(client, "p1"))
+      client.write("p2 APPEND INBOX {#{RAW.bytesize}}\r\n")
+      assert_match(/\A\+ /, client.gets("\r\n"))
+      client.write("#{RAW}\r\n")
+      assert_match(/\Ap2 NO \[OVERQUOTA\]/, read_until_tagged(client, "p2"))
+
+      # REPLACE and CLOSE's implicit expunge go the read-only way too.
+      client.write("p3 REPLACE 1 INBOX {#{RAW.bytesize}+}\r\n#{RAW}\r\n")
+      assert_match(/\Ap3 NO Mailbox is read-only/, read_until_tagged(client, "p3"))
+      assert_match(/\Ac1 OK/, command(client, "c1", "CLOSE"))
+      command(client, "z", "LOGOUT")
+    end
+
+    assert_equal before, canary_state
+    assert_includes @store.honeypot_events.first[:transcript], "APPEND Junk", "the attempts are still the intel"
+  end
+
+  def canary_state
+    @store.list_mailboxes(@canary_id)[:mailboxes].sort.to_h do |name|
+      [ name, @store.select_mailbox(@canary_id, name)[:messages] ]
+    end
+  end
+
+  def test_a_real_account_keeps_read_write_mailboxes
+    with_session do |client|
+      client.gets("\r\n")
+      command(client, "a1", "LOGIN real@example.test #{PASSWORD}")
+      assert_match(/^a2 OK \[READ-WRITE\] SELECT completed/, command(client, "a2", "SELECT INBOX"))
+      assert_match(/^a3 OK/, command(client, "a3", "CREATE Projects"))
+      client.write("a4 APPEND Projects {#{RAW.bytesize}+}\r\n#{RAW}\r\n")
+      assert_match(/\Aa4 OK \[APPENDUID/, read_until_tagged(client, "a4"))
+      command(client, "a5", "LOGOUT")
+    end
+  end
+
+  # A canary session ends after HONEYPOT_SESSION_SECONDS whatever it is
+  # doing - here, sitting in IDLE, which no inactivity timeout touches.
+  def test_canary_session_is_ended_after_its_short_lifetime
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    with_session(spec: { tls: :implicit, honeypot_session_seconds: 0.5 }) do |client|
+      client.gets("\r\n")
+      command(client, "a1", "LOGIN #{CANARY} #{PASSWORD}")
+      command(client, "a2", "SELECT INBOX")
+      client.write("a3 IDLE\r\n")
+      assert_match(/\A\+ /, client.gets("\r\n"))
+
+      assert_nil client.gets("\r\n"), "the server hangs up"
+    end
+
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 3
+    assert_equal "honeypot_session_limit", @session.instance_variable_get(:@close_reason)
+    assert_equal 300, MailOnRails::ImapServer::HONEYPOT_SESSION_SECONDS
+  end
+
+  def test_a_real_session_has_no_such_lifetime
+    with_session(spec: { tls: :implicit, honeypot_session_seconds: 0.3 }) do |client|
+      client.gets("\r\n")
+      command(client, "a1", "LOGIN real@example.test #{PASSWORD}")
+      sleep 0.8
+      assert_match(/\Aa2 OK/, command(client, "a2", "NOOP"))
+      command(client, "a3", "LOGOUT")
+    end
+  end
+
+  # L21 (audit 2026-11-17): the probe signatures ran on authenticated
+  # lines too, where they match ordinary commands - this APPEND read as
+  # shellshock, so the user's draft was dropped and a honeypot event
+  # recorded against the user.
+  def test_probe_signatures_are_not_run_on_an_authenticated_session
+    with_session do |client|
+      client.gets("\r\n")
+      command(client, "a1", "LOGIN real@example.test #{PASSWORD}")
+      command(client, "a2", "CREATE Drafts")
+      client.write("a3 APPEND Drafts () {#{RAW.bytesize}}\r\n")
+      assert_match(/\A\+ /, client.gets("\r\n"), "the literal is accepted")
+      client.write("#{RAW}\r\n")
+      assert_match(/\Aa3 OK \[APPENDUID/, read_until_tagged(client, "a3"))
+      command(client, "a4", "SELECT Drafts")
+      assert_match(/^a5 OK/, command(client, "a5", %(SEARCH HEADER Message-ID "<${run{x}}@evil.example>")))
+      command(client, "a6", "LOGOUT")
+    end
+
+    assert_empty @store.honeypot_events
+    refute @session.honeypot_fired?
+  end
+
   def test_transcript_redacts_the_login_password
     with_session do |client|
       client.gets("\r\n")

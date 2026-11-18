@@ -9,6 +9,8 @@ require "mail_on_rails/settings"
 require "mail_on_rails/netserv/config"
 require "mail_on_rails/netserv/server"
 require "mail_on_rails/netserv/account_limiter"
+require "mail_on_rails/netserv/bounded_reader"
+require "mail_on_rails/imap/deadline_watch"
 require "mail_on_rails/imap/session_helpers"
 require "mail_on_rails/imap/utf7"
 require "mail_on_rails/imap/version"
@@ -41,6 +43,23 @@ module MailOnRails
     # memory in read_command by streaming an endless run of tiny (often
     # LITERAL+) literals before a single command is ever dispatched.
     MAX_COMMAND_LITERALS = 256
+    # The literal caps bound literal octets, not the command around them:
+    # 256 empty literals, each followed by another full line, used to be a
+    # 16 MiB command, every byte of it tokenized. A command's text - all
+    # of its line fragments together, however literals split it - is held
+    # to what a single line may be (MAX_LINE), and to a token count no
+    # client approaches: the longest legitimate commands are one long
+    # sequence set (a single token), a few dozen FETCH items or SEARCH
+    # keys, or MAX_KEYWORDS flags.
+    MAX_COMMAND_TOKENS = 1024
+    # Before authentication a command is CAPABILITY, STARTTLS, ID (RFC 2971
+    # allows 30 field/value pairs), LOGIN or AUTHENTICATE with a base64
+    # response: a few hundred bytes, a handful of tokens, two literals at
+    # most. Everything a stranger can make the server read and tokenize is
+    # held to that scale.
+    MAX_PREAUTH_COMMAND_BYTES = 8 * 1024
+    MAX_PREAUTH_COMMAND_TOKENS = 128
+    MAX_PREAUTH_LITERALS = 3
     # Guards against a maliciously deep SEARCH key (nested parens / NOT /
     # OR) recursing parse_search_key into a SystemStackError, which - not
     # being a StandardError - would escape the command handler and kill the
@@ -72,8 +91,31 @@ module MailOnRails
     MAX_LIST_WILDCARDS = 16
     # Keyword flags are atoms (RFC 3501 §9): 7-bit printable, none of the
     # atom-specials, and short; they are echoed in FETCH responses.
+    # MAX_KEYWORDS bounds one command's flag list and, since +FLAGS
+    # accumulates, what a single message may carry in total.
     MAX_KEYWORD_BYTES = 255
     MAX_KEYWORDS = 128
+    # Mailboxes per account. Every LIST walks them all and CREATE a/b/c
+    # makes each level; heavy real accounts have a few hundred folders.
+    MAX_MAILBOXES = 1000
+    # FETCH data items per command, after duplicates are dropped. Clients
+    # ask for a handful (iOS: eight; a per-part body download: two per
+    # part); each item is evaluated per message.
+    MAX_FETCH_ITEMS = 64
+    # A FETCH response is written out as it is built; literals at least
+    # this large go to the socket on their own instead of through the
+    # response buffer, so one message's response never holds more than one
+    # large item.
+    FETCH_DIRECT_WRITE_BYTES = 64 * 1024
+    # SEARCH keys per command (every key, NOT/OR and parenthesized group
+    # counts). Mail clients send a handful; a search built from a user's
+    # filter rules, a few dozen. Each key is evaluated per message.
+    MAX_SEARCH_KEYS = 128
+    # Ancestor-walk steps one THREAD=REFERENCES may spend on loop checks.
+    # A mailbox of ordinary conversations costs a few steps per message;
+    # only References chains crafted to build one very deep placeholder
+    # tree approach this, and past it further links are simply not made.
+    MAX_THREAD_LINK_STEPS = 10_000_000
     # Store calls per command are bounded: metadata for up to
     # FETCH_META_BATCH messages at a time, raw bytes for at most
     # FETCH_RAW_BATCH messages or FETCH_RAW_BATCH_BYTES per call (sizes come
@@ -93,6 +135,26 @@ module MailOnRails
     # min); a peer that has connected but not logged in gets far less, so
     # a connection flood can't park sockets for half an hour each.
     PREAUTH_TIMEOUT = 120
+    # Absolute time from the greeting to a successful login. The
+    # inactivity timeout alone is reset by any byte, so NOOP every 100 s
+    # (or a command trickled a byte at a time) used to hold a connection
+    # slot for the whole session lifetime without ever logging in. A real
+    # client authenticates within seconds of connecting; one that prompts
+    # its user for the password while connected reconnects when it has it.
+    PREAUTH_DEADLINE = 120
+    # Commands and protocol errors allowed before authentication. A login
+    # is CAPABILITY, perhaps STARTTLS and ID, and up to MAX_AUTH_ATTEMPTS
+    # attempts; nothing legitimate sends dozens of commands, or a run of
+    # unparseable ones, to a server it has not logged in to.
+    MAX_PREAUTH_COMMANDS = 40
+    MAX_PREAUTH_ERRORS = 10
+    # How long a session logged in to a canary (honeypot) account may
+    # last. Long enough to watch what the intruder reaches for; short
+    # enough that a guessed canary is not a day-long authenticated session.
+    HONEYPOT_SESSION_SECONDS = 300
+    # Outbound lines are logged (transcript, trace) for protocol flow
+    # only: literals are replaced by their size and the line cut here.
+    MAX_LOGGED_REPLY_BYTES = 1024
     # Base capabilities; STARTTLS/LOGINDISABLED/AUTH are appended per-state.
     # APPENDLIMIT=<n> (RFC 7889) advertises one upload limit for every
     # mailbox - the same cap the literal reader enforces.
@@ -147,14 +209,24 @@ module MailOnRails
 
     # Splits a command line (with literals already inlined as separate
     # elements) into tokens: strings, :lparen and :rparen.
+    #
+    # It runs on every line a peer sends, before any state check, so it is
+    # strictly one pass: each byte is scanned once. Lexing stops, with
+    # #error set (the text of the BAD reply), at an unterminated quoted
+    # string or past +max_tokens+; the tokens lexed so far stay available
+    # (the tag, for the reply).
     class Lexer
-      attr_reader :tokens
+      attr_reader :tokens, :error
 
-      def initialize(parts)
+      def initialize(parts, max_tokens: nil)
         @tokens = []
+        @error = nil
+        @max_tokens = max_tokens
         parts.each do |part|
+          break if @error
+
           if part.is_a?(Array) # [:lit, data]
-            @tokens << part[1]
+            push(part[1])
           else
             tokenize(part.chomp("\r\n").sub(/\{\d+\+?\}\z/, ""))
           end
@@ -163,26 +235,49 @@ module MailOnRails
 
       private
 
+      def push(token)
+        return @error = "Too many arguments" if @max_tokens && @tokens.size >= @max_tokens
+
+        @tokens << token
+      end
+
       def tokenize(str)
         s = StringScanner.new(str)
-        until s.eos?
-          if s.scan(/\s+/)
+        # Set once a search for "]" has run off the end of the line: no
+        # later atom on it can find one either, so none looks again.
+        unclosed = false
+        until s.eos? || @error
+          if s.skip(/\s+/)
             next
-          elsif s.scan(/\(/)
-            @tokens << :lparen
-          elsif s.scan(/\)/)
-            @tokens << :rparen
-          elsif (quoted = s.scan(/"(?:\\.|[^"\\])*"/))
-            @tokens << quoted[1..-2].gsub(/\\(.)/, '\1')
-          elsif (atom = s.scan(/[^\s()"]+/))
-            atom = +atom
+          elsif s.skip(/\(/)
+            push(:lparen)
+          elsif s.skip(/\)/)
+            push(:rparen)
+          elsif s.check(/"/)
+            # A quote that never closes used to be skipped one character
+            # at a time, re-trying this match to the end of the line at
+            # every later quote - quadratic in the line. It is a syntax
+            # error; say so once.
+            quoted = s.scan(/"(?:\\.|[^"\\])*"/) or return @error = "Unterminated quoted string"
+            push(quoted[1..-2].gsub(/\\(.)/, '\1'))
+          else
+            atom = +s.scan(/[^\s()"]+/)
             # Bracketed fetch sections may contain spaces and parens:
             # BODY.PEEK[HEADER.FIELDS (DATE SUBJECT)]<0.2048>
-            atom << s.scan(/[^\]]*\]/).to_s while atom.count("[") > atom.count("]") && s.check(/[^\]]*\]/)
+            # The open-bracket depth is carried along rather than
+            # recounted over the growing atom at every step.
+            depth = atom.count("[") - atom.count("]")
+            while depth.positive? && !unclosed
+              more = s.scan(/[^\]]*\]/)
+              if more
+                depth += more.count("[") - 1
+                atom << more
+              else
+                unclosed = true
+              end
+            end
             atom << s.scan(/<\d+(?:\.\d+)?>/).to_s
-            @tokens << atom
-          else
-            s.getch
+            push(atom)
           end
         end
       end
@@ -205,12 +300,18 @@ module MailOnRails
       # next LOGIN without a restart.
       @account_sessions = Netserv::AccountLimiter.new(-> { Settings[:imap_max_sessions_per_account] })
 
+      # Absolute per-session deadlines (see PREAUTH_DEADLINE and
+      # HONEYPOT_SESSION_SECONDS), enforced for every session in the
+      # process by one watcher thread.
+      @deadlines = Imap::DeadlineWatch.new
+
       class << self
-        attr_reader :account_sessions
+        attr_reader :account_sessions, :deadlines
       end
 
       def initialize(socket, store, spec, tls_ctx)
         @socket = socket
+        @reader = Netserv::BoundedReader.new(socket)
         @store = store
         @spec = spec
         @tls_ctx = tls_ctx
@@ -249,6 +350,7 @@ module MailOnRails
         # How far the session got, for idle_reason.
         @commands_seen = 0
         @auth_tried = false
+        @preauth_commands = 0
       end
 
       # Honeypot hooks (Netserv::HoneypotSession). IMAP carries no HELO.
@@ -325,6 +427,7 @@ module MailOnRails
 
       def run
         set_timeout(session_timeout)
+        arm_deadline(@spec[:preauth_deadline] || PREAUTH_DEADLINE, "preauth_deadline") { @account_id.nil? }
         untagged "OK [CAPABILITY #{capabilities}] #{honeypot_banner || "IMAP server ready"}"
         until @logout
           parts = read_command
@@ -356,6 +459,7 @@ module MailOnRails
         @close_reason = "session_error"
         @store.log(:error, "IMAP session error: #{e.class}: #{e.message} #{e.backtrace&.first}")
       ensure
+        self.class.deadlines.disarm(self)
         release_account_session
         begin
           @socket.close
@@ -365,6 +469,25 @@ module MailOnRails
       end
 
       private
+
+      # Ends the session +seconds+ from now, whatever it is doing, unless
+      # +still_due+ answers false by then: the watcher closes the raw
+      # socket, which raises in this thread's blocked read (the mechanism
+      # the server's lifetime reaper uses; no goodbye line - the session
+      # may be mid-write). A deadline checked only between commands would
+      # be outlasted by a single command trickled in a byte at a time.
+      # One deadline per session; arming again replaces it.
+      def arm_deadline(seconds, reason, &still_due)
+        at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+        self.class.deadlines.arm(self, at) do
+          next unless still_due.call
+
+          @close_reason ||= reason
+          @store.log(:info, "IMAP closing connection: #{reason.tr("_", " ")} of #{seconds}s passed" \
+                            "#{@username && " for #{@username}"} (#{peer_ip})")
+          io_for(@socket).close
+        end
+      end
 
       # Why this session's transcript is worth keeping, or nil for a
       # session with nothing to diagnose (same policy as SMTP): a close
@@ -396,18 +519,27 @@ module MailOnRails
 
       # -- transport ---------------------------------------------------------
 
-      # Reads one line, capped at MAX_LINE. Returns nil at EOF; aborts the
-      # session on an over-length line rather than draining attacker bytes.
-      def read_line
-        line = @socket.gets("\r\n", MAX_LINE)
+      # Reads one line, capped at MAX_LINE (far less before authentication).
+      # Returns nil at EOF; aborts the session on an over-length line rather
+      # than draining attacker bytes. Through the bounded reader: on a TLS
+      # socket a bare gets applies its limit only once the terminator has
+      # arrived, buffering without bound until then.
+      def read_line(limit = line_limit)
+        line = @reader.gets("\r\n", limit)
         return nil if line.nil?
 
-        if !line.end_with?("\r\n") && line.bytesize >= MAX_LINE
-          untagged "BAD Command line too long"
-          @close_reason = "protocol_abuse" # before the raise; run's rescue keeps it
-          raise IOError, "command line too long"
-        end
+        abort_oversize("Command line too long") if !line.end_with?("\r\n") && line.bytesize >= limit
         line
+      end
+
+      def line_limit
+        @account_id ? MAX_LINE : [ MAX_PREAUTH_COMMAND_BYTES, MAX_LINE ].min
+      end
+
+      def abort_oversize(message)
+        untagged "BAD #{message}"
+        @close_reason = "protocol_abuse" # before the raise; run's rescue keeps it
+        raise IOError, message.downcase
       end
 
       # Reads one command; IMAP literals ({n}\r\n) are read in full and kept
@@ -423,12 +555,18 @@ module MailOnRails
       end
 
       def read_one_command
+        return nil if preauth_budget_spent?
+
         line = read_line
         return nil unless line
 
         parts = [ line ]
         literal_count = 0
         literal_octets = 0
+        # The command's text across all of its fragments is held to one
+        # line's worth (see MAX_COMMAND_TOKENS): the budget left after
+        # each fragment is the next read's limit.
+        text_budget = line_limit - line.bytesize
         while (m = parts.last.match(/\{(\d+)(\+)?\}\r\n\z/))
           size = m[1].to_i
           non_sync = !m[2].nil?
@@ -438,7 +576,8 @@ module MailOnRails
           # too many octets in aggregate: all refuse the same way, draining
           # any LITERAL+ payload so the stream stays framed.
           limit = @account_id ? MAX_LITERAL_BYTES : [ MAX_PREAUTH_LITERAL_BYTES, MAX_LITERAL_BYTES ].min
-          if size > limit || literal_count > MAX_COMMAND_LITERALS ||
+          max_literals = @account_id ? MAX_COMMAND_LITERALS : MAX_PREAUTH_LITERALS
+          if size > limit || literal_count > max_literals ||
              literal_octets > limit
             # Except pre-auth LITERAL+: there the drain that keeps the
             # stream framed is itself the forced read being refused, so
@@ -451,23 +590,56 @@ module MailOnRails
             end
             return refuse_literal(parts.first, size, non_sync: non_sync)
           end
+          # In the clear the only command that carries a literal is a
+          # LOGIN that will be refused anyway (PRIVACYREQUIRED). Answering
+          # its synchronizing literal with a continuation would solicit
+          # the credentials in cleartext first; withhold it and refuse
+          # now, before the client has sent them.
+          return refuse_cleartext_literal(parts.first) if tls_required? && !non_sync
+
           @socket.write("+ OK\r\n") unless m[2] # synchronizing literal
           data = read_exact(size)
           return nil unless data
 
           parts << [ :lit, data ]
-          nxt = read_line
+          abort_oversize("Command too long") unless text_budget.positive?
+          nxt = read_line(text_budget)
           return nil unless nxt
 
+          text_budget -= nxt.bytesize
           parts << nxt
         end
         parts
       end
 
+      # True (after saying goodbye) once an unauthenticated peer has used
+      # up its commands or its protocol errors. Counted per command read,
+      # refused literals included.
+      def preauth_budget_spent?
+        return false if @account_id
+
+        @preauth_commands += 1
+        return false if @preauth_commands <= (@spec[:preauth_commands] || MAX_PREAUTH_COMMANDS) &&
+                        @protocol_errors < (@spec[:preauth_errors] || MAX_PREAUTH_ERRORS)
+
+        untagged "BYE Too many commands before authentication"
+        @close_reason = "protocol_abuse"
+        @logout = true
+      end
+
+      # Counts as a login attempt for idle_reason when the line names one
+      # (a refused login is still a peer that tried).
+      def refuse_cleartext_literal(first_line)
+        @auth_tried = true if first_line.match?(/\A\s*\S+\s+(?:UID\s+)?"?(?:LOGIN|AUTHENTICATE)\b/i)
+        @protocol_errors += 1
+        tagged echo_token(first_line.split(" ", 2).first), "NO [PRIVACYREQUIRED] STARTTLS required before sending literals"
+        :refused
+      end
+
       def read_exact(size)
         data = +"".b
         while data.bytesize < size
-          chunk = @socket.read(size - data.bytesize)
+          chunk = @reader.read(size - data.bytesize)
           return nil unless chunk
 
           data << chunk
@@ -497,7 +669,10 @@ module MailOnRails
           non_sync = !m[2].nil?
         end
         # RFC 7889/4469: over-limit uploads get the TOOBIG response code
-        # so clients report "too large" instead of retrying.
+        # so clients report "too large" instead of retrying. Before
+        # authentication it spends error budget; afterwards it is a user
+        # attaching too large a file, not a protocol error.
+        @protocol_errors += 1 unless @account_id
         tagged tag, "NO [TOOBIG] literal too large"
         :refused
       end
@@ -505,7 +680,7 @@ module MailOnRails
       def discard_exact(size)
         remaining = size
         while remaining.positive?
-          chunk = @socket.read([ remaining, 65_536 ].min)
+          chunk = @reader.read([ remaining, 65_536 ].min)
           return false unless chunk
 
           remaining -= chunk.bytesize
@@ -514,15 +689,48 @@ module MailOnRails
       end
 
       def untagged(text)
-        honeypot_transcript.outbound("* #{text}")
-        trace("=>", "* #{text}")
+        log_reply("* #{text}")
         @socket.write("* #{text}\r\n")
       end
 
       def tagged(tag, text)
-        honeypot_transcript.outbound("#{tag} #{text}")
-        trace("=>", "#{tag} #{text}")
+        log_reply("#{tag} #{text}")
         @socket.write("#{tag} #{text}\r\n")
+      end
+
+      # What the transcript and the trace log keep of a reply: its
+      # protocol shape. A literal is replaced by its size - the stored
+      # transcript promises "no message content", and literals are where
+      # ENVELOPE/BODYSTRUCTURE strings and LIST names with non-ASCII or
+      # long values travel - and the line is cut short. (FETCH responses
+      # do not come through here; see write_fetch_response.)
+      def log_reply(line)
+        line = omit_literals(line) if line.include?("}\r\n")
+        log_reply_shape(line)
+      end
+
+      # +line+ already holds no literal data.
+      def log_reply_shape(line)
+        if line.bytesize > MAX_LOGGED_REPLY_BYTES
+          line = "#{line.byteslice(0, MAX_LOGGED_REPLY_BYTES)}... (#{line.bytesize} bytes)"
+        end
+        honeypot_transcript.outbound(line)
+        trace("=>", line)
+      end
+
+      # A reply's text contains CRLF only where a literal header ends
+      # (anything else with a line break in it is sent as a literal), so
+      # "{n}CRLF" outside literal data is always a real header; each
+      # literal is skipped by its declared length, never scanned.
+      def omit_literals(line)
+        bytes = line.b
+        out = +"".b
+        pos = 0
+        while (header = bytes.match(/\{(\d+)\}\r\n/n, pos))
+          out << bytes.byteslice(pos, header.begin(0) - pos) << "{#{header[1]}}<omitted>"
+          pos = header.end(0) + header[1].to_i
+        end
+        out << bytes.byteslice(pos..).to_s
       end
 
       # One traced protocol line, opt-in via imap_trace (resolved at session
@@ -533,7 +741,10 @@ module MailOnRails
       def trace(direction, line)
         return unless @trace
 
-        flat = line.gsub(/\r?\n/, '\n')
+        # CR and LF each get their visible escape (as in the transcript):
+        # a lone CR passed through would let a client line overwrite the
+        # start of its own log line on a terminal.
+        flat = line.b.gsub(/[\r\n]/n) { |byte| byte == "\r" ? '\r' : '\n' }
         flat = "#{flat[0, 400]}... (#{line.bytesize} bytes)" if flat.size > 400
         @store.log(:info, "IMAP #{direction} #{flat} (#{peer_ip})")
       end
@@ -560,24 +771,42 @@ module MailOnRails
         user.scrub.gsub(/[^[:graph:]]/, "?")[0, 80]
       end
 
-      # Redacts credentials from a command line before it enters the honeypot
-      # transcript - the same no-password policy the SMTP tracer keeps. LOGIN's
-      # user and password both go (parsing a quoted/literal username safely is
-      # not worth the risk of leaking the password beside it); AUTHENTICATE
-      # keeps its mechanism but drops any initial response. Everything else is
-      # recorded verbatim - it is the intel.
-      def redact_imap(line)
-        # Leading whitespace is tolerated by the lexer, so it must not be a
-        # way past the redaction.
-        case line
-        when /\A\s*(\S+)\s+(LOGIN)\b/i
-          "#{Regexp.last_match(1)} #{Regexp.last_match(2).upcase} [redacted]"
-        when /\A\s*(\S+)\s+(AUTHENTICATE)\s+(\S+)(.*)/i
-          rest = Regexp.last_match(4).to_s.strip.empty? ? "" : " [redacted]"
-          "#{Regexp.last_match(1)} #{Regexp.last_match(2).upcase} #{Regexp.last_match(3)}#{rest}"
+      # Redacts credentials from a command line before it enters the
+      # transcript or the trace log - the same no-password policy the SMTP
+      # tracer keeps. LOGIN's user and password both go (parsing a
+      # quoted/literal username safely is not worth the risk of leaking the
+      # password beside it); AUTHENTICATE keeps its mechanism but drops any
+      # initial response. Everything else is recorded verbatim - it is the
+      # intel.
+      #
+      # Decided on the lexer's tokens, the same ones dispatch reads: a
+      # pattern over the raw line disagreed with the lexer about what the
+      # command was (a quoted "LOGIN", a quoted tag with a space in it, a
+      # UID prefix), and each disagreement logged a password. +complete+ is
+      # false when the lexer gave up part-way; a line it could not read to
+      # the end is redacted if it so much as names a login command.
+      def redact_command(raw, tokens, complete)
+        tag, name, *rest = tokens.take(5)
+        name = rest.shift if name.is_a?(String) && name.casecmp?("UID") && rest.first.is_a?(String)
+        shown_tag = tag.is_a?(String) ? echo_token(tag) : "*"
+        case name.is_a?(String) && name.upcase
+        when "LOGIN"
+          "#{shown_tag} LOGIN [redacted]"
+        when "AUTHENTICATE"
+          mechanism = rest.first.is_a?(String) ? echo_token(rest.first) : ""
+          "#{shown_tag} AUTHENTICATE #{mechanism}#{" [redacted]" if rest.length > 1}".rstrip
         else
-          line
+          return raw if complete && tag.is_a?(String) && name.is_a?(String)
+
+          raw.match?(/LOGIN|AUTHENTICATE/i) ? "[redacted: unparsed line naming LOGIN or AUTHENTICATE]" : raw
         end
+      end
+
+      # One raw line, lexed and redacted (handle redacts the tokens it
+      # already has).
+      def redact_imap(line)
+        lexer = Lexer.new([ line ])
+        redact_command(line, lexer.tokens, lexer.error.nil?)
       end
 
       # -- dispatch ----------------------------------------------------------
@@ -588,8 +817,14 @@ module MailOnRails
         # transcript). LOGIN/AUTHENTICATE arguments are redacted; a literal
         # password never reaches here anyway, it arrives as a [:lit, data] part.
         raw = parts.first.to_s.chomp
-        probe = Netserv::ProbeSignatures.detect(raw)
-        redacted = redact_imap(raw)
+        # Only a stranger's lines are probes. Run against an authenticated
+        # session the signatures match ordinary commands - "APPEND Drafts
+        # () {310}" reads as shellshock - dropping the user's message and
+        # recording a honeypot event against the user.
+        probe = @account_id ? nil : Netserv::ProbeSignatures.detect(raw)
+        lexer = Lexer.new(parts, max_tokens: @account_id ? MAX_COMMAND_TOKENS : MAX_PREAUTH_COMMAND_TOKENS)
+        tokens = lexer.tokens
+        redacted = redact_command(raw, tokens, lexer.error.nil?)
         honeypot_transcript.inbound(redacted)
         trace("<=", redacted)
         # Exploit-probe payloads, foreign protocols (HTTP at a mail port, a
@@ -604,10 +839,13 @@ module MailOnRails
           return tagged(raw[/\A[\x21-\x7e]+/] || "*", "BAD Unknown command")
         end
 
-        tokens = Lexer.new(parts).tokens
         tag = tokens.shift
         name = tokens.shift
-        unless tag && name.is_a?(String)
+        if lexer.error
+          @protocol_errors += 1
+          return tagged(tag.is_a?(String) ? echo_token(tag) : "*", "BAD #{lexer.error}")
+        end
+        unless tag.is_a?(String) && name.is_a?(String)
           @protocol_errors += 1
           return untagged("BAD Empty command")
         end
@@ -619,6 +857,12 @@ module MailOnRails
         if name.casecmp?("UID") && tokens.first.is_a?(String)
           uid_mode = true
           name = tokens.shift
+          # UID prefixes only the message commands; "UID LOGIN" is not a
+          # second spelling of LOGIN.
+          unless UID_COMMANDS.include?(name.upcase)
+            @protocol_errors += 1
+            return tagged(tag, "BAD UID is not valid with #{echo_token(name.upcase)}")
+          end
         end
 
         dispatch(tag, name.upcase, tokens, uid_mode)
@@ -637,7 +881,22 @@ module MailOnRails
         tagged tag || "*", "BAD Internal error"
       end
 
+      UID_COMMANDS = %w[FETCH STORE COPY MOVE SEARCH EXPUNGE SORT THREAD REPLACE].freeze
+
+      # Commands whose grammar is the bare word. Trailing arguments are a
+      # syntax error (as on Cyrus and Gmail) rather than ignored: "NOOP
+      # <64 KiB of anything>" answered OK was a free way to spend the
+      # server's time without tripping an error.
+      BARE_COMMANDS = %w[CAPABILITY NOOP LOGOUT].freeze
+
       def dispatch(tag, name, args, uid_mode)
+        if BARE_COMMANDS.include?(name) && args.any?
+          @protocol_errors += 1
+          return tagged(tag, "BAD #{name} takes no arguments")
+        end
+
+        return if @account_id && honeypot_refusal(tag, name)
+
         case name
         when "CAPABILITY"   then capability(tag)
         when "NOOP", "CHECK" then resync; tagged tag, "OK #{name} completed"
@@ -706,6 +965,7 @@ module MailOnRails
         when :notfound then "[TRYCREATE] "
         when :overquota then "[OVERQUOTA] "
         when :unavailable then "[UNAVAILABLE] "
+        when :cannot then "[CANNOT] "
         else ""
         end
       end
@@ -736,6 +996,9 @@ module MailOnRails
         # inactivity timeout.
         set_timeout(handshake_timeout)
         @socket = Netserv::Tls.accept(io_for(@socket), @tls_ctx)
+        # A fresh reader for the TLS side (it holds no cleartext: on a
+        # plain socket the bounded reader buffers nothing of its own).
+        @reader = Netserv::BoundedReader.new(@socket)
         @tls = true
         set_timeout(session_timeout)
         # Discard pre-TLS session state; the client re-authenticates.
@@ -794,6 +1057,7 @@ module MailOnRails
         # Only base64 the *client* sent. Anything else that raises in here
         # is ours, and belongs in the generic handler's "BAD Internal
         # error" with a logged backtrace - not blamed on the client.
+        @protocol_errors += 1
         tagged tag, "BAD Invalid base64"
       end
 
@@ -872,7 +1136,7 @@ module MailOnRails
 
         return if ip_lockout_refusal(tag, "AUTHENTICATE", user)
 
-        creds = @store.scram_credentials(user, ip: throttle_ip)
+        creds = scram_lookup(user)
         return auth_throttled(tag, "AUTHENTICATE", user, creds[:retry_after]) if creds[:throttled]
 
         if creds[:error]
@@ -888,9 +1152,18 @@ module MailOnRails
         server_first = "r=#{nonce},s=#{creds[:salt_base64]},i=#{creds[:iterations]}"
         reply = sasl_challenge(tag, [ server_first ].pack("m0")) { return } or return
 
-        client_final = decode_base64(reply)
-        final_attrs = scram_attrs(client_final)
-        proof = decode_base64(final_attrs["p"])
+        # By now the store has looked the account up and the salt has
+        # gone out: an undecodable reply ends a real attempt, and is
+        # counted as one. Left to the BAD-base64 rescue it cost nothing,
+        # so one connection could drive credential lookups without limit,
+        # none of them recorded.
+        begin
+          client_final = decode_base64(reply)
+          final_attrs = scram_attrs(client_final)
+          proof = decode_base64(final_attrs["p"])
+        rescue Imap::SessionHelpers::InvalidBase64
+          return scram_failure(tag, user, creds, reply: "BAD Invalid base64")
+        end
         without_proof = client_final[/\A(.*),p=[^,]*\z/m, 1].to_s
         auth_message = "#{bare},#{server_first},#{without_proof}"
 
@@ -903,9 +1176,12 @@ module MailOnRails
         unless final_attrs["r"] == nonce &&
                final_attrs["c"] == [ gs2.b + cb_data.to_s.b ].pack("m0") &&
                Scram.valid_proof?(stored_key, auth_message, proof)
-          return scram_failure(tag, user)
+          return scram_failure(tag, user, creds)
         end
 
+        # The proof is the verdict: the exchange counted up front is
+        # given back here, whatever becomes of the last round trip.
+        scram_verified(creds)
         server_key = creds[:server_key_base64].unpack1("m0")
         verifier = "v=#{[ Scram.server_signature(server_key, auth_message) ].pack("m0")}"
         empty = sasl_challenge(tag, [ verifier ].pack("m0")) { return } or return
@@ -914,7 +1190,7 @@ module MailOnRails
 
         authenticated(creds[:account_id], creds[:email])
         @store.log(:info, "IMAP login #{creds[:email]} (#{peer_ip}, SCRAM#{"-PLUS" if plus})")
-        honeypot_login! if creds[:honeypot]
+        canary_login if creds[:honeypot]
         tagged tag, "OK [CAPABILITY #{capabilities}] AUTHENTICATE completed"
       end
 
@@ -926,9 +1202,37 @@ module MailOnRails
       # here against verifier material, so the store never sees the failure
       # and has to be told, or SCRAM would be an unthrottled way around the
       # LOGIN throttle.
-      def scram_failure(tag, user)
-        @store.record_auth_failure(user.to_s, ip: throttle_ip)
-        auth_failure(tag, user)
+      #
+      # +creds+ carries the reservation when the lookup counted this
+      # exchange up front; the store then logs it without counting twice.
+      def scram_failure(tag, user, creds = nil, reply: nil)
+        if (reservation = creds && creds[:reservation])
+          @store.record_auth_failure(user.to_s, ip: throttle_ip, reservation: reservation)
+        else
+          @store.record_auth_failure(user.to_s, ip: throttle_ip)
+        end
+        auth_failure(tag, user, reply: reply)
+      end
+
+      # The verifier lookup, counted as a failed attempt before any
+      # material is handed out when the store can take it back
+      # (record_auth_success): parallel exchanges then each see the
+      # others in the throttle's budget instead of all passing the check
+      # first, and one the client walks away from after the challenge
+      # stays counted. A store without that method (the memory store)
+      # is asked the old way.
+      def scram_lookup(user)
+        if @store.respond_to?(:record_auth_success)
+          @store.scram_credentials(user, ip: throttle_ip, reserve: true)
+        else
+          @store.scram_credentials(user, ip: throttle_ip)
+        end
+      end
+
+      def scram_verified(creds)
+        return unless creds[:reservation]
+
+        @store.record_auth_success(creds[:email], reservation: creds[:reservation])
       end
 
       # Shared failed-auth accounting for LOGIN/AUTHENTICATE paths that
@@ -938,11 +1242,11 @@ module MailOnRails
       # same ordering as the SMTP session. Store-throttled and store-error
       # outcomes never come through here: the credentials were not checked,
       # so they must not count toward the lockout.
-      def auth_failure(tag, user)
+      def auth_failure(tag, user, reply: nil)
         @auth_attempts += 1
         @on_auth_failure&.call
         @store.log(:warn, "IMAP auth failed for #{log_user(user)} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
-        tagged tag, "NO [AUTHENTICATIONFAILED] Invalid credentials"
+        tagged tag, reply || "NO [AUTHENTICATIONFAILED] Invalid credentials"
         disconnect_if_attempts_exhausted
       end
 
@@ -1007,7 +1311,7 @@ module MailOnRails
           @store.log(:info, "IMAP login #{result[:email]} (#{peer_ip})")
           # A login against a canary can only be an attacker: record it and ban
           # the source, but let them in so we observe what they FETCH/SEARCH.
-          honeypot_login! if result[:honeypot]
+          canary_login if result[:honeypot]
           tagged tag, "OK [CAPABILITY #{capabilities}] #{verb} completed"
         elsif result[:throttled]
           auth_throttled(tag, verb, user, result[:retry_after])
@@ -1019,11 +1323,45 @@ module MailOnRails
       end
 
       # The session is now someone's: the pre-auth inactivity bound gives
-      # way to the configured one.
+      # way to the configured one, and the connect-to-auth deadline is met.
       def authenticated(account_id, email)
         @account_id = account_id
         @username = email
+        self.class.deadlines.disarm(self)
         set_timeout(session_timeout)
+      end
+
+      # A canary exists to be guessed, so whoever holds this session is a
+      # stranger with a valid login: they get to look, and nothing else.
+      # Every mailbox opens read-only and every command that would write
+      # is refused the way a locked or full account refuses it (see
+      # honeypot_refusal) - so the session cannot store data, cannot file
+      # mail into or out of Junk (which trains the server-wide spam
+      # classifier), and cannot stay: it ends after
+      # HONEYPOT_SESSION_SECONDS however busy it keeps itself.
+      def canary_login
+        honeypot_login!
+        arm_deadline(@spec[:honeypot_session_seconds] || HONEYPOT_SESSION_SECONDS, "honeypot_session_limit") { true }
+      end
+
+      # The refusals a canary session gets for commands that would change
+      # the account. Uploads meet a full quota and structural changes a
+      # permission error - both things real servers say to real users, so
+      # the account reads as restricted rather than as a trap. (STORE,
+      # EXPUNGE and MOVE are answered by the read-only mailbox.)
+      HONEYPOT_REFUSALS = {
+        "APPEND" => "[OVERQUOTA] APPEND failed: quota exceeded",
+        "COPY" => "[OVERQUOTA] COPY failed: quota exceeded",
+        "CREATE" => "[NOPERM] CREATE failed: permission denied",
+        "DELETE" => "[NOPERM] DELETE failed: permission denied",
+        "RENAME" => "[NOPERM] RENAME failed: permission denied"
+      }.freeze
+
+      def honeypot_refusal(tag, name)
+        return false unless honeypot? && HONEYPOT_REFUSALS.key?(name)
+
+        tagged tag, "NO #{HONEYPOT_REFUSALS[name]}"
+        true
       end
 
       # The credentials were right but the account already holds its full
@@ -1217,7 +1555,10 @@ module MailOnRails
         # A trailing hierarchy separator only declares the intent to
         # create children under the name (RFC 3501 §6.3.3).
         name = name.chomp("/")
-        create_missing_parents(name)
+        existing = mailbox_names
+        return if mailbox_limit_refusal(tag, "CREATE", name, existing, adding: existing.include?(name) ? 0 : 1)
+
+        create_missing_parents(name, existing)
         result = @store.create_mailbox(@account_id, name)
         if result[:error]
           store_failure(tag, "CREATE", result, exists: "[ALREADYEXISTS] ")
@@ -1281,7 +1622,9 @@ module MailOnRails
       # else (:internal - an exception inside the store, whose text names
       # adapters, tables and SQL) is logged here with the command context
       # and answered with a fixed temporary failure.
-      KNOWN_STORE_CODES = %i[notfound exists overquota infected unavailable].freeze
+      # :cannot is the store declining a mailbox name on rules of its own
+      # (answered like the names the session declines itself).
+      KNOWN_STORE_CODES = %i[notfound exists overquota infected unavailable cannot].freeze
 
       def store_failure(tag, verb, result, codes = {})
         unless KNOWN_STORE_CODES.include?(result[:code])
@@ -1295,14 +1638,30 @@ module MailOnRails
 
       # RFC 3501 §6.3.3/§6.3.5: a name with hierarchy separators SHOULD
       # cause any missing superior names to be created too.
-      def create_missing_parents(name)
-        existing = mailbox_names
+      def create_missing_parents(name, existing = mailbox_names)
+        missing_parents(name, existing).each { |parent| @store.create_mailbox(@account_id, parent) }
+      end
+
+      # The superior names of +name+ that don't exist yet, outermost first.
+      def missing_parents(name, existing)
         prefix = +""
-        name.split("/")[0..-2].each do |component|
+        name.split("/")[0..-2].filter_map do |component|
           prefix << "/" unless prefix.empty?
           prefix << component
-          @store.create_mailbox(@account_id, prefix.dup) unless existing.include?(prefix)
+          prefix.dup unless existing.include?(prefix)
         end
+      end
+
+      # Refuses (RFC 5530 LIMIT) a command that would take the account
+      # past MAX_MAILBOXES, counting the parents it would create and the
+      # +adding+ mailboxes of its own. Accounts already past the cap keep
+      # everything they have; they just can't add to it.
+      def mailbox_limit_refusal(tag, verb, name, existing, adding:)
+        added = missing_parents(name, existing).length + adding
+        return false if added.zero? || existing.length + added <= MAX_MAILBOXES
+
+        tagged tag, "NO [LIMIT] #{verb} failed: too many mailboxes"
+        true
       end
 
       def delete(tag, args)
@@ -1322,7 +1681,10 @@ module MailOnRails
         to = mailbox_name_arg(tag, args[1], "RENAME") or return
         return rename_inbox(tag, to) if from.casecmp?("INBOX")
 
-        create_missing_parents(to)
+        existing = mailbox_names
+        return if mailbox_limit_refusal(tag, "RENAME", to, existing, adding: 0)
+
+        create_missing_parents(to, existing)
         result = @store.rename_mailbox(@account_id, from, to)
         if result[:error]
           store_failure(tag, "RENAME", result, exists: "[ALREADYEXISTS] ", notfound: "[NONEXISTENT] ")
@@ -1341,11 +1703,13 @@ module MailOnRails
       # remain in place. Sessions with INBOX selected learn about the
       # moved messages through their next resync.
       def rename_inbox(tag, to)
-        if to.casecmp?("INBOX") || mailbox_names.include?(to)
+        existing = mailbox_names
+        if to.casecmp?("INBOX") || existing.include?(to)
           return tagged(tag, "NO [ALREADYEXISTS] RENAME failed: mailbox exists")
         end
+        return if mailbox_limit_refusal(tag, "RENAME", to, existing, adding: 1)
 
-        create_missing_parents(to)
+        create_missing_parents(to, existing)
         result = @store.create_mailbox(@account_id, to)
         return store_failure(tag, "RENAME", result, exists: "[ALREADYEXISTS] ") if result[:error]
 
@@ -1400,7 +1764,8 @@ module MailOnRails
       end
 
       def select(tag, args, read_only:)
-        name = mailbox_name_arg(tag, args.first, read_only ? "EXAMINE" : "SELECT") or return
+        examine = read_only
+        name = mailbox_name_arg(tag, args.first, examine ? "EXAMINE" : "SELECT") or return
 
         @condstore = true if args.any? { |a| a.is_a?(String) && a.casecmp?("CONDSTORE") }
         qresync = parse_qresync_param(args)
@@ -1419,6 +1784,8 @@ module MailOnRails
         untagged "OK [CLOSED] Previous mailbox closed" if was_selected && @qresync
 
         @selected = { mailbox_id: result[:mailbox_id], name: result[:name] }
+        # A canary session never gets a writable mailbox (see canary_login).
+        read_only ||= honeypot?
         @read_only = read_only
         # RFC 5182: a successful SELECT/EXAMINE resets the search result.
         @saved_search = []
@@ -1436,7 +1803,7 @@ module MailOnRails
         untagged "OK [HIGHESTMODSEQ #{@highest_modseq}] Highest"
         untagged "OK [MAILBOXID (#{result[:mailbox_object_id]})] Ok" if result[:mailbox_object_id]
         qresync_catch_up(qresync, result) if qresync
-        tagged tag, "OK [#{read_only ? "READ-ONLY" : "READ-WRITE"}] #{read_only ? "EXAMINE" : "SELECT"} completed"
+        tagged tag, "OK [#{read_only ? "READ-ONLY" : "READ-WRITE"}] #{examine ? "EXAMINE" : "SELECT"} completed"
       end
 
       # Extracts "QRESYNC (uidvalidity modseq [known-uids [(seq-match)]])"
@@ -1762,6 +2129,12 @@ module MailOnRails
         end
         items << "UID" if uid_mode && items.none? { |i| i.casecmp?("UID") }
         return tagged(tag, "BAD FETCH expects data items") if items.empty?
+
+        # Every item is evaluated for every message, so the list is what
+        # multiplies a FETCH: the same item a hundred times over was a
+        # hundred copies of each message in one response.
+        items = items.uniq(&:upcase)
+        return tagged(tag, "BAD Too many FETCH data items") if items.length > MAX_FETCH_ITEMS
         if (bad = items.find { |i| !valid_fetch_item?(i) })
           return tagged(tag, "BAD Unknown FETCH item #{echo_token(bad)}")
         end
@@ -1782,7 +2155,7 @@ module MailOnRails
           newly_seen = mark_fetched_seen(items, batch.filter_map { |_seq, uid| messages[uid] })
           batch.each do |seq, uid|
             msg = messages[uid] or next
-            untagged "#{seq} FETCH (#{fetch_items(msg, items, announce_seen: newly_seen.include?(uid)).join(" ")})"
+            write_fetch_response(seq, msg, items, announce_seen: newly_seen.include?(uid))
           end
         end
         tagged tag, "OK FETCH completed"
@@ -1899,50 +2272,128 @@ module MailOnRails
         uids
       end
 
-      def fetch_items(msg, items, announce_seen: false)
+      # Writes one message's FETCH response as it is built, instead of
+      # assembling the whole line first: small items collect in a buffer,
+      # a large literal goes to the socket on its own, so the response
+      # for a message never holds more than one large item however many
+      # BODY[...] sections were asked for.
+      #
+      # The transcript and trace get the response's shape only - item
+      # names, flags, literal sizes. ENVELOPE, BODYSTRUCTURE, PREVIEW and
+      # every literal are message content, which the stored transcript
+      # promises not to hold.
+      #
+      # Each piece is appended as bytes: items come in different encodings
+      # (a UTF-8 PREVIEW beside a binary body section), and joining those
+      # as strings raises once both hold non-ASCII bytes.
+      def write_fetch_response(seq, msg, items, announce_seen: false)
+        wire = "* #{seq} FETCH (".b
+        shape = +"* #{seq} FETCH ("
+        first = true
+        each_fetch_item(msg, items, announce_seen: announce_seen) do |text, literal, shown|
+          separator = first ? "" : " "
+          first = false
+          wire << separator << text.b
+          shape << separator << (shown || text) if shape.bytesize <= MAX_LOGGED_REPLY_BYTES
+          next unless literal
+
+          wire << "{#{literal.bytesize}}\r\n"
+          shape << "{#{literal.bytesize}}<omitted>"
+          if literal.bytesize >= FETCH_DIRECT_WRITE_BYTES
+            @socket.write(wire)
+            @socket.write(literal)
+            wire = +"".b
+          else
+            wire << literal.b
+          end
+        end
+        @socket.write(wire << ")\r\n")
+        log_reply_shape(shape << ")")
+      end
+
+      # Yields each data item of one message's response as [text, literal,
+      # shown]: the protocol text, the octets that follow it as a literal
+      # (or nil), and what the log shows in place of the text (nil: the
+      # text itself).
+      #
+      # An item that raises is answered with its empty form rather than
+      # failing the command: by then part of the response is on the wire,
+      # and one message whose bytes trip the MIME code must not make the
+      # whole mailbox unreadable - a client re-fetches a failed range.
+      def each_fetch_item(msg, items, announce_seen: false)
         parsed = nil
         parse = -> { parsed ||= Imap::Mime.parse(msg[:raw]) }
         flags = @flags[msg[:uid]] || msg[:flags]
-        out = []
+        failed = false
 
         items.each do |item|
-          case item.upcase
-          when "UID"           then out << "UID #{msg[:uid]}"
-          when "MODSEQ"        then out << "MODSEQ (#{@modseqs[msg[:uid]] || msg[:modseq] || 1})"
-          when "FLAGS"         then out << "FLAGS (#{flags.join(" ")})"
-          when "INTERNALDATE"  then out << %(INTERNALDATE "#{internal_date(msg)}")
-          when "RFC822.SIZE"   then out << "RFC822.SIZE #{msg[:size]}"
-          when "ENVELOPE"      then out << "ENVELOPE #{Imap::Mime.envelope(parse.call)}"
-          when "BODY" then out << "BODY #{Imap::Mime.bodystructure(parse.call)}"
-          when "BODYSTRUCTURE" then out << "BODYSTRUCTURE #{Imap::Mime.bodystructure(parse.call, extended: true)}"
-          when "EMAILID"       then out << "EMAILID (#{msg[:email_id]})" if msg[:email_id]
-          when "THREADID"      then out << (msg[:thread_id] ? "THREADID (#{msg[:thread_id]})" : "THREADID NIL")
-          when "SAVEDATE"
-            out << (msg[:saved_date] ? %(SAVEDATE "#{Time.at(msg[:saved_date]).strftime("%d-%b-%Y %H:%M:%S %z")}") : "SAVEDATE NIL")
-          when "PREVIEW"       then out << "PREVIEW #{Imap::Mime.quote(Imap::Mime.preview(parse.call))}"
-          when "RFC822"        then out << "RFC822 #{Imap::Mime.literal(msg[:raw])}"
-          when "RFC822.HEADER" then out << "RFC822.HEADER #{Imap::Mime.literal(parse.call.header_block)}"
-          when "RFC822.TEXT"   then out << "RFC822.TEXT #{Imap::Mime.literal(parse.call.body)}"
-          else
-            if (m = item.match(/\ABODY(\.PEEK)?\[(.*)\](?:<(\d+)(?:\.(\d+))?>)?\z/i))
-              _peek, section, start, count = m[1], m[2], m[3], m[4]
-              data = Imap::Mime.section(parse.call, section)
-              label = +"BODY[#{section.upcase}]"
-              if data && start
-                data = data.byteslice(start.to_i, count ? count.to_i : data.bytesize).to_s
-                label << "<#{start}>"
-              end
-              out << "#{label} #{data ? Imap::Mime.literal(data) : "NIL"}"
+          piece = begin
+            fetch_item(item, msg, flags, parse)
+          rescue StandardError, SystemStackError => e
+            unless failed
+              @store.log(:error, "IMAP FETCH item #{echo_token(item)} failed for uid #{msg[:uid]}: " \
+                                 "#{e.class}: #{e.message} #{e.backtrace&.first}")
             end
+            failed = true
+            empty_fetch_item(item)
           end
+          yield piece if piece
         end
 
         # Notify the client of the implicit \Seen unless FLAGS was already
         # in the response.
-        if announce_seen && items.none? { |i| i.casecmp?("FLAGS") }
-          out << "FLAGS (#{flags.join(" ")})"
+        yield [ "FLAGS (#{flags.join(" ")})" ] if announce_seen && items.none? { |i| i.casecmp?("FLAGS") }
+      end
+
+      def fetch_item(item, msg, flags, parse)
+        case item.upcase
+        when "UID"           then [ "UID #{msg[:uid]}" ]
+        when "MODSEQ"        then [ "MODSEQ (#{@modseqs[msg[:uid]] || msg[:modseq] || 1})" ]
+        when "FLAGS"         then [ "FLAGS (#{flags.join(" ")})" ]
+        when "INTERNALDATE"  then [ %(INTERNALDATE "#{internal_date(msg)}") ]
+        when "RFC822.SIZE"   then [ "RFC822.SIZE #{msg[:size]}" ]
+        when "ENVELOPE"      then [ "ENVELOPE #{Imap::Mime.envelope(parse.call)}", nil, "ENVELOPE <omitted>" ]
+        when "BODY"          then [ "BODY #{Imap::Mime.bodystructure(parse.call)}", nil, "BODY <omitted>" ]
+        when "BODYSTRUCTURE"
+          [ "BODYSTRUCTURE #{Imap::Mime.bodystructure(parse.call, extended: true)}", nil, "BODYSTRUCTURE <omitted>" ]
+        when "EMAILID"       then [ "EMAILID (#{msg[:email_id]})" ] if msg[:email_id]
+        when "THREADID"      then [ msg[:thread_id] ? "THREADID (#{msg[:thread_id]})" : "THREADID NIL" ]
+        when "SAVEDATE"
+          [ msg[:saved_date] ? %(SAVEDATE "#{Time.at(msg[:saved_date]).strftime("%d-%b-%Y %H:%M:%S %z")}") : "SAVEDATE NIL" ]
+        when "PREVIEW"
+          [ "PREVIEW #{Imap::Mime.quote(Imap::Mime.preview(parse.call))}", nil, "PREVIEW <omitted>" ]
+        when "RFC822"        then [ "RFC822 ", msg[:raw].to_s ]
+        when "RFC822.HEADER" then [ "RFC822.HEADER ", parse.call.header_block ]
+        when "RFC822.TEXT"   then [ "RFC822.TEXT ", parse.call.body ]
+        else
+          m = item.match(/\ABODY(\.PEEK)?\[(.*)\](?:<(\d+)(?:\.(\d+))?>)?\z/i) or return nil
+          section, start, count = m[2], m[3], m[4]
+          data = Imap::Mime.section(parse.call, section)
+          label = +"BODY[#{section.upcase}]"
+          if data && start
+            # Clamped to the data before slicing: an origin or count past
+            # a machine word ("<99999999999999999999.5>") is otherwise a
+            # RangeError, and it selects nothing either way.
+            origin = [ start.to_i, data.bytesize ].min
+            data = data.byteslice(origin, count ? [ count.to_i, data.bytesize ].min : data.bytesize).to_s
+            label << "<#{start}>"
+          end
+          data ? [ "#{label} ", data ] : [ "#{label} NIL" ]
         end
-        out
+      end
+
+      # The grammar's empty value for an item that could not be produced:
+      # NIL for the nstring items, an all-NIL envelope, a bare text/plain
+      # structure. Metadata items never get here.
+      def empty_fetch_item(item)
+        case item.upcase
+        when "ENVELOPE" then [ "ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)" ]
+        when "BODY", "BODYSTRUCTURE" then [ %(#{item.upcase} ("TEXT" "PLAIN" NIL NIL NIL "7BIT" 0 0)) ]
+        when "PREVIEW", "RFC822", "RFC822.HEADER", "RFC822.TEXT" then [ "#{item.upcase} NIL" ]
+        else
+          m = item.match(/\ABODY(?:\.PEEK)?\[(.*)\]/i)
+          [ "BODY[#{m[1].upcase}] NIL" ] if m
+        end
       end
 
       def internal_date(msg)
@@ -2012,6 +2463,9 @@ module MailOnRails
           wanted, failed = wanted.partition { |_seq, uid| (@modseqs[uid] || 1) <= unchangedsince }
         end
         return tagged(tag, store_completion(failed, uid_mode)) if wanted.empty?
+        if mode == "+" && wanted.any? { |_seq, uid| keyword_overflow?(@flags[uid] || [], flags) }
+          return tagged(tag, "NO [LIMIT] STORE failed: too many keywords on a message")
+        end
 
         result = @store.store_flags(@selected[:mailbox_id], wanted.map(&:last), mode, flags)
         updated = {}
@@ -2032,6 +2486,21 @@ module MailOnRails
           end
         end
         tagged tag, store_completion(failed, uid_mode)
+      end
+
+      # True when adding +flags+ to a message carrying +current+ would
+      # leave it with more than MAX_KEYWORDS keywords. One command's list
+      # is capped by parse_flag_list, but +FLAGS accumulates: forty
+      # commands used to hang five thousand keywords on one message, all
+      # of them re-sent in every FETCH FLAGS and every snapshot. System
+      # flags don't count, so a message at the cap can still be marked
+      # seen or deleted.
+      def keyword_overflow?(current, flags)
+        return false if current.length + flags.length <= MAX_KEYWORDS
+
+        keywords = ->(list) { list.reject { |f| f.start_with?("\\") }.uniq(&:downcase).length }
+        after = keywords.call(current + flags)
+        after > MAX_KEYWORDS && after > keywords.call(current)
       end
 
       # RFC 7162: messages skipped by UNCHANGEDSINCE are reported in a
@@ -2227,18 +2696,25 @@ module MailOnRails
           case key
           when "ARRIVAL" then msg[:internal_date]
           when "SIZE"    then msg[:size]
-          when "DATE"
-            begin
-              Time.parse(read_header.call("date")).to_i
-            rescue ArgumentError, TypeError
-              msg[:internal_date]
-            end
+          when "DATE" then sent_time(read_header.call("date"), msg)
           when "FROM" then first_addr_mailbox(read_header.call("from"))
           when "TO"   then first_addr_mailbox(read_header.call("to"))
           when "CC"   then first_addr_mailbox(read_header.call("cc"))
           when "SUBJECT" then base_subject(read_header.call("subject"))
           end
         end
+      end
+
+      # The Date header as epoch seconds, INTERNALDATE when it is missing
+      # or unparseable. The header is the sender's to write, and
+      # Time.parse raises more than ArgumentError on what it can be made
+      # to hold (RangeError for an out-of-range field): any failure to
+      # read one message's date is that message's fallback, never the
+      # mailbox's failed SORT or THREAD.
+      def sent_time(value, msg)
+        Time.parse(value.to_s).to_i
+      rescue StandardError
+        msg[:internal_date]
       end
 
       def first_addr_mailbox(value)
@@ -2316,12 +2792,7 @@ module MailOnRails
         base = strip_subject_markers(subject)
         references = trim_references(header_msg_ids(headers, "references"))
         references = header_msg_ids(headers, "in-reply-to").first(1) if references.empty?
-        date = begin
-          Time.parse(headers["date"]&.first.to_s).to_i
-        rescue ArgumentError, TypeError
-          msg[:internal_date]
-        end
-        { num: uid_mode ? uid : seq, uid: uid, date: date,
+        { num: uid_mode ? uid : seq, uid: uid, date: sent_time(headers["date"]&.first, msg),
           message_id: header_msg_ids(headers, "message-id").first,
           references: references,
           subject: base,
@@ -2358,7 +2829,17 @@ module MailOnRails
       # containers for referenced messages outside the result set - then
       # prune the placeholders, merge root threads sharing a base subject,
       # sort siblings by date, and render.
+      #
+      # Each link is first checked for a loop. Linking something that has
+      # no children yet cannot make one; anything else means walking the
+      # would-be parent's ancestors, which costs the depth of the tree -
+      # chains written to grow one tree thousands deep made a thousand
+      # small messages half a minute of CPU. The walks draw on a
+      # per-command budget (MAX_THREAD_LINK_STEPS); once it is spent the
+      # remaining links are not made and those messages thread where they
+      # already stand.
       def references_threads(entries)
+        @thread_link_steps = MAX_THREAD_LINK_STEPS
         containers = Hash.new { |h, k| h[k] = { entry: nil, children: [], parent: nil } }
         entries.each do |entry|
           id = entry[:message_id] || "no-id-#{entry[:uid]}"
@@ -2381,7 +2862,7 @@ module MailOnRails
           # any speculative link an earlier chain made (unless that
           # would loop).
           if previous && !previous.equal?(container) && !thread_ancestor?(container, previous)
-            container[:parent]&.dig(:children)&.delete(container)
+            disown(container)
             adopt(previous, container)
           end
         end
@@ -2397,10 +2878,28 @@ module MailOnRails
         parent[:children] << child
       end
 
-      # True when +node+ is +other+ or one of its ancestors.
+      # Unlinks +child+ from its parent (by identity: two empty
+      # placeholders are == to each other).
+      def disown(child)
+        parent = child[:parent] or return
+
+        @thread_link_steps -= parent[:children].length
+        parent[:children].delete_if { |c| c.equal?(child) }
+        child[:parent] = nil
+      end
+
+      # True when +node+ is +other+ or one of its ancestors - and when the
+      # command's walk budget is spent, since a link that can't be proven
+      # loop-free is not made.
       def thread_ancestor?(node, other)
+        # A node without children is nobody's ancestor but its own: the
+        # usual case (a message, or a reference, seen for the first time)
+        # needs no walk at all.
+        return node.equal?(other) if node[:children].empty?
+
         while other
           return true if other.equal?(node)
+          return true if (@thread_link_steps -= 1).negative?
 
           other = other[:parent]
         end
@@ -2410,39 +2909,48 @@ module MailOnRails
       # JWZ step 2: drop placeholders for messages outside the result
       # set, promoting their children - except that a placeholder at the
       # root keeps a multi-child sibling group together (it renders as
-      # "((a)(b))"). Bottom-up over an explicit traversal rather than
+      # "((a)(b))"). Top down over an explicit stack rather than
       # recursion: a References chain is as deep as the client makes it,
-      # and the Ruby stack is not the place to find out how deep.
+      # and the Ruby stack is not the place to find out how deep. Each
+      # node is looked at once - promoting level by level instead copies
+      # a growing child list at every placeholder of a long chain.
       def prune_placeholders(roots)
-        descendants_first(roots).each do |node|
-          node[:children] = node[:children].flat_map { |child| prune_node(child, root: false) }
-        end
-        roots.flat_map { |node| prune_node(node, root: true) }
-      end
+        kept = roots.flat_map do |root|
+          next [ root ] if root[:entry]
 
-      def prune_node(node, root:)
-        if node[:entry]
-          [ node ]
-        elsif node[:children].empty?
-          []
-        elsif !root || node[:children].size == 1
-          node[:children].each { |c| c[:parent] = node[:parent] }
-          node[:children]
-        else
-          [ node ]
+          children = surviving_children(root)
+          if children.size > 1
+            root[:children] = children
+            [ root ]
+          else
+            children.each { |child| child[:parent] = nil }
+          end
         end
-      end
 
-      # Every node under +roots+ (inclusive), children before parents.
-      def descendants_first(roots)
-        order = []
-        stack = roots.dup
+        stack = kept.dup
         until stack.empty?
           node = stack.pop
-          order << node
+          node[:children] = surviving_children(node) if node[:entry]
+          node[:children].each { |child| child[:parent] = node }
           stack.concat(node[:children])
         end
-        order.reverse!
+        kept
+      end
+
+      # The messages directly under +node+ once the placeholders between
+      # are dissolved, in order.
+      def surviving_children(node)
+        found = []
+        stack = node[:children].reverse
+        until stack.empty?
+          child = stack.pop
+          if child[:entry]
+            found << child
+          else
+            stack.concat(child[:children].reverse)
+          end
+        end
+        found
       end
 
       # RFC 5256 step 4: root threads sharing a base subject merge into
@@ -2451,9 +2959,10 @@ module MailOnRails
       # under a fresh placeholder when neither is clearly the parent.
       def merge_threads_by_subject(roots)
         table = {}
+        slots = {} # subject => its thread's index in merged
         merged = []
-        replace = lambda do |old, new, subject|
-          merged[merged.index { |n| n.equal?(old) }] = new
+        replace = lambda do |_old, new, subject|
+          merged[slots[subject]] = new
           table[subject] = new
         end
 
@@ -2461,7 +2970,10 @@ module MailOnRails
           subject = thread_subject(root)
           other = table[subject] unless subject.empty?
           if other.nil?
-            table[subject] = root unless subject.empty?
+            unless subject.empty?
+              table[subject] = root
+              slots[subject] = merged.length
+            end
             merged << root
           elsif other[:entry].nil? && root[:entry].nil?
             root[:children].each { |c| adopt(other, c) }
@@ -2553,6 +3065,8 @@ module MailOnRails
       # batches, under the MAX_SEARCH_RAW_* budget. Raises
       # SearchSyntaxError on bad keys, SearchLimitError past the budget.
       def search_hits(criteria, uid_mode)
+        @search_key_count = 0
+        @search_memo = {}
         matchers = []
         matchers << parse_search_key(criteria, uid_mode) until criteria.empty?
         matchers.compact!
@@ -2570,6 +3084,35 @@ module MailOnRails
         hits = filter_fetched(hits, by_level[LEVEL_META], false) if by_level[LEVEL_META] && hits.any?
         hits = filter_fetched(hits, by_level[LEVEL_RAW], true) if by_level[LEVEL_RAW] && hits.any?
         hits
+      ensure
+        @search_memo = nil
+      end
+
+      # What a search key resolves to is computed once per command, however
+      # often the command repeats it: the same sequence set or the same
+      # store-answered key a thousand times over is one set of ranges, one
+      # store query, one result set. (Each used to build its own.)
+      def search_memo(*key)
+        @search_memo.fetch(key) { @search_memo[key] = yield }
+      end
+
+      # The uids a store-answered key matches, fetched when the first
+      # message is tested against it and shared by every repeat of the key.
+      def pushdown_uids(*key, &query)
+        search_memo(:pushdown, *key) do
+          loaded = nil
+          -> { loaded ||= (query.call[:uids] || []).to_set }
+        end
+      end
+
+      # A sequence-set search key as merged ranges (see parse_ranges) - a
+      # few ranges to binary-search per message, not a Set of every
+      # message the set covers, per key. nil for a mailbox with nothing
+      # in it (resolve_set's answer too: no set is parsed against it).
+      def search_ranges(set, uid_mode)
+        return nil if @uids.empty?
+
+        search_memo(:ranges, set, uid_mode) { parse_ranges(set, uid_mode ? @uids.last : @uids.length) }
       end
 
       def filter_fetched(pairs, keys, need_raw)
@@ -2646,6 +3189,9 @@ module MailOnRails
         tok = toks.shift
         return nil if tok.nil?
 
+        @search_key_count += 1
+        raise SearchLimitError, "Too many search keys" if @search_key_count > MAX_SEARCH_KEYS
+
         if tok == :lparen
           keys = []
           keys << parse_search_key(toks, uid_mode, depth + 1) until toks.empty? || toks.first == :rparen
@@ -2683,8 +3229,14 @@ module MailOnRails
 
           SearchKey.new([ a.level, b.level ].max, ->(seq, msg) { a.call(seq, msg) || b.call(seq, msg) })
         when "UID"
-          uids = resolve_set(toks.shift.to_s, true).map(&:last).to_set
-          snapshot_key { |_seq, msg| uids.include?(msg[:uid]) }
+          set = toks.shift.to_s
+          if set == "$"
+            saved = search_memo(:saved) { @saved_search.to_set }
+            snapshot_key { |_seq, msg| saved.include?(msg[:uid]) }
+          else
+            ranges = search_ranges(set, true)
+            snapshot_key { |_seq, msg| !ranges.nil? && ranges_cover?(ranges, msg[:uid]) }
+          end
         when "LARGER"  then column_key("size", (toks.shift.to_i + 1)..)
         when "SMALLER" then column_key("size", (...toks.shift.to_i))
         when "SINCE"  then date_key(toks.shift, :since)
@@ -2723,11 +3275,11 @@ module MailOnRails
           snapshot_key { |_seq, msg| (@modseqs[msg[:uid]] || 1) >= value }
         when "$"
           # SEARCHRES: the saved search result as a search key.
-          saved = @saved_search.to_set
+          saved = search_memo(:saved) { @saved_search.to_set }
           snapshot_key { |_seq, msg| saved.include?(msg[:uid]) }
         when /\A[\d*][\d,:*]*\z/
-          seqs = resolve_set(tok, false).map(&:first).to_set
-          snapshot_key { |seq, _msg| seqs.include?(seq) }
+          ranges = search_ranges(tok, false)
+          snapshot_key { |seq, _msg| !ranges.nil? && ranges_cover?(ranges, seq) }
         else
           raise SearchSyntaxError, "Unknown search key #{echo_token(tok.upcase)}"
         end
@@ -2773,11 +3325,8 @@ module MailOnRails
           return meta_key { |_seq, msg| matcher.call(msg[symbol]) }
         end
 
-        uids = nil
-        snapshot_key do |_seq, msg|
-          uids ||= (@store.search_meta(@selected[:mailbox_id], field, value)[:uids] || []).to_set
-          uids.include?(msg[:uid])
-        end
+        uids = pushdown_uids(:meta, field, value) { @store.search_meta(@selected[:mailbox_id], field, value) }
+        snapshot_key { |_seq, msg| uids.call.include?(msg[:uid]) }
       end
 
       # The epoch-second window a day comparison covers; the day's
@@ -2805,9 +3354,11 @@ module MailOnRails
         day = parse_search_date(str)
         raw_key do |_seq, msg|
           value = Imap::Mime.parse_headers(Imap::Mime.split_header(msg[:raw].to_s)[0])["date"]&.first
+          # StandardError: Date.parse raises RangeError too, and one
+          # message's hostile header must not fail the mailbox's search.
           sent_day = begin
             value && Date.parse(value)
-          rescue ArgumentError, TypeError
+          rescue StandardError
             nil
           end
           !sent_day.nil? && compare.call(sent_day, day)
@@ -2848,11 +3399,8 @@ module MailOnRails
         name = name.downcase
         value = value.downcase
         if PUSHDOWN_HEADERS.include?(name) && @store.respond_to?(:search_header) && value.match?(/[[:alnum:]]/)
-          uids = nil
-          return snapshot_key do |_seq, msg|
-            uids ||= (@store.search_header(@selected[:mailbox_id], name, value)[:uids] || []).to_set
-            uids.include?(msg[:uid])
-          end
+          uids = pushdown_uids(:header, name, value) { @store.search_header(@selected[:mailbox_id], name, value) }
+          return snapshot_key { |_seq, msg| uids.call.include?(msg[:uid]) }
         end
 
         raw_key do |_seq, msg|
@@ -2871,11 +3419,8 @@ module MailOnRails
       def content_key(value, scope)
         return substring_key(value, scope) unless @store.respond_to?(:search_text) && value.match?(/[[:alnum:]]/)
 
-        uids = nil
-        snapshot_key do |_seq, msg|
-          uids ||= (@store.search_text(@selected[:mailbox_id], value, scope)[:uids] || []).to_set
-          uids.include?(msg[:uid])
-        end
+        uids = pushdown_uids(:text, scope, value) { @store.search_text(@selected[:mailbox_id], value, scope) }
+        snapshot_key { |_seq, msg| uids.call.include?(msg[:uid]) }
       end
 
       # RFC 3501 TEXT/BODY semantics: case-insensitive substring over the
@@ -3049,6 +3594,9 @@ module MailOnRails
       # True when input is waiting, false on timeout. TLS can hold
       # decrypted bytes buffered past the raw fd, so check there first.
       def wait_readable(seconds)
+        # The bounded reader may already hold the next line (on TLS it
+        # reads ahead in blocks); sleeping on the socket would miss it.
+        return true if @reader.buffered?
         return true if @socket.respond_to?(:pending) && @socket.pending.positive?
 
         !io_for(@socket).wait_readable(seconds).nil?

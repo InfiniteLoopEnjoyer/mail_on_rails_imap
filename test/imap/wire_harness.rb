@@ -16,11 +16,14 @@ module WireHarness
     @account_id = @store.add_account(email: EMAIL, password: PASSWORD)
     @listener = TCPServer.new("127.0.0.1", 0)
     @sessions = []
+    @session_objects = []
     @clients = []
     @acceptor = Thread.new do
       loop do
         sock = @listener.accept
-        @sessions << Thread.new { MailOnRails::ImapServer::Session.new(sock, @store, { tls: :implicit }, nil).run }
+        session = MailOnRails::ImapServer::Session.new(sock, @store, session_spec, nil)
+        @session_objects << session
+        @sessions << Thread.new { session.run }
       end
     rescue IOError, SystemCallError
       # listener closed in teardown
@@ -33,6 +36,10 @@ module WireHarness
     @acceptor.join(2)
     @sessions.each { |t| t.join(5) }
   end
+
+  # The listener spec every session is built with; suites override it to
+  # turn on tracing or shorten a deadline.
+  def session_spec = { tls: :implicit }
 
   def connect(login: true)
     client = TCPSocket.new("127.0.0.1", @listener.addr[1])

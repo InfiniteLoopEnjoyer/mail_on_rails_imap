@@ -199,7 +199,9 @@ class CveMailboxTest < Minitest::Test
       assert_match(/\At#{i} NO/, command(c, "t#{i}", "SELECT #{name}"), "SELECT #{name.inspect}")
     end
     # CVE-2005-2933 shape: an unclosed quote must not desync the parser.
-    assert_match(/\Aq1 NO/, command(c, "q1", %(SELECT "Unclosed)))
+    # It is a syntax error (the lexer no longer skips the quote and reads
+    # on - that retry was quadratic), so BAD rather than "no such mailbox".
+    assert_match(/\Aq1 BAD Unterminated quoted string/, command(c, "q1", %(SELECT "Unclosed)))
     assert_match(/\Az1 OK/, command(c, "z1", "NOOP"))
   end
 

@@ -16,6 +16,21 @@ module MailOnRails
       # batches what it asks for, but a store call must not load a whole
       # uid list of raw messages either.
       COPY_BATCH = 100
+      # ...and no more than this many message bytes per batch (plus one
+      # message): a hundred rows of mail at the size SMTP accepts would be
+      # gigabytes in one result set.
+      COPY_BATCH_BYTES = 32 * 1024 * 1024
+
+      # The message's bytes (raw) and its extracted text (body_text) live
+      # in the same table row as its uid and flags, and a full-row load
+      # ships them: selecting a mailbox, a NOOP, every IDLE poll, a flag
+      # change and an expunge each used to read the entire contents of
+      # every message they touched - whatever anyone had mailed in - to
+      # get at a few integers. Every query below that does not hand the
+      # bytes to its caller names its columns.
+      FETCH_COLUMNS = %i[id mailbox_id uid flags internal_date size modseq email_object_id thread_id created_at].freeze
+      FLAG_COLUMNS = %i[id mailbox_id uid flags modseq].freeze
+      EXPUNGE_COLUMNS = %i[id mailbox_id uid flags size].freeze
 
       # Quarantine holds flagged malware and is reachable only through the
       # web review UI, never over IMAP: it is hidden from LIST and every
@@ -41,7 +56,27 @@ module MailOnRails
 
           mailbox = account.mailboxes.create!(name: name)
           { mailbox_object_id: mailbox_object_id(mailbox) }
+        rescue ActiveRecord::RecordInvalid => e
+          unusable_mailbox_name(e)
         end
+      end
+
+      # The Mailbox model has the last word on what a folder may be called
+      # (it guards every writer, not only IMAP), and its rules go beyond
+      # what the session checks before calling: edge whitespace, a second
+      # "inbox", a child that a parent's rename would push past the length
+      # or depth bound. A name it refuses is the client's request being
+      # declined - :cannot, which the session answers NO [CANNOT] - not a
+      # store fault for db's handler to log at error level. The reason is
+      # one of the model's own fixed strings, never client bytes. Anything
+      # else that fails validation is still a fault and re-raised.
+      def unusable_mailbox_name(invalid)
+        errors = invalid.record.errors
+        raise invalid if errors[:name].empty?
+        # The uniqueness check losing a race with another session's CREATE.
+        return { error: "mailbox exists", code: :exists } if errors.of_kind?(:name, :taken)
+
+        { error: "invalid mailbox name (#{errors[:name].first})", code: :cannot }
       end
 
       # MAILBOXID (RFC 8474): pk + uid_validity - survives rename, never
@@ -84,6 +119,10 @@ module MailOnRails
             mailbox.update!(name: to)
           end
           {}
+        rescue ActiveRecord::RecordInvalid => e
+          # Raised by the mailbox or by any child being renamed with it;
+          # the transaction has rolled the whole rename back.
+          unusable_mailbox_name(e)
         end
       end
 
@@ -92,7 +131,7 @@ module MailOnRails
           mailbox = find_visible_mailbox(EmailAccount.find(account_id), name)
           next { error: "no such mailbox", code: :notfound } unless mailbox
 
-          messages = mailbox.email_messages.order(:uid).map { |m| [ m.uid, m.flags, m.modseq ] }
+          messages = mailbox.email_messages.order(:uid).pluck(:uid, :flags, :modseq)
           {
             mailbox_id: mailbox.id,
             name: mailbox.name,
@@ -127,6 +166,7 @@ module MailOnRails
       def fetch(mailbox_id, uids, with_raw)
         db do
           scope = EmailMessage.where(mailbox_id: mailbox_id, uid: uids).order(:uid)
+          scope = scope.select(*FETCH_COLUMNS, *(:raw if with_raw))
           messages = scope.map do |m|
             entry = {
               uid: m.uid,
@@ -155,7 +195,7 @@ module MailOnRails
       # a store that changes nothing claims no new modseq.
       def store_flags(mailbox_id, uids, mode, flags)
         db do
-          updated = EmailMessage.where(mailbox_id: mailbox_id, uid: uids).map do |m|
+          updated = EmailMessage.where(mailbox_id: mailbox_id, uid: uids).select(*FLAG_COLUMNS).map do |m|
             new_flags =
               case mode
               when "+" then m.flags + flags.reject { |f| m.flags.any? { |e| e.casecmp?(f) } }
@@ -182,6 +222,7 @@ module MailOnRails
           # case-insensitive (RFC 3501) match.
           deleted = EmailMessage.where(mailbox_id: mailbox_id)
                                 .where("LOWER(flags) LIKE ?", "%deleted%")
+                                .select(*EXPUNGE_COLUMNS)
                                 .order(:uid)
           deleted = deleted.where(uid: uids) if uids
           deleted = deleted.select { |m| m.flags.any? { |f| f.casecmp?("\\Deleted") } }
@@ -409,14 +450,36 @@ module MailOnRails
 
       private
 
-      # Yields the mailbox's messages for +uids+ in uid order, loading
-      # COPY_BATCH rows (raw bytes included) per query. The uid list is
-      # sliced in Ruby rather than find_each'd so the order stays by uid,
-      # not primary key.
+      # Yields the mailbox's messages for +uids+ in uid order, as full
+      # rows (COPY and MOVE need the bytes and every recorded verdict),
+      # loading at most COPY_BATCH rows and COPY_BATCH_BYTES of message
+      # (plus one message) per query: the sizes are read first, without
+      # the bytes, and the batches cut from them. The uid list is sliced
+      # in Ruby rather than find_each'd so the order stays by uid, not
+      # primary key.
       def each_message_batch(mailbox_id, uids, &block)
         uids.sort.each_slice(COPY_BATCH) do |slice|
-          EmailMessage.where(mailbox_id: mailbox_id, uid: slice).order(:uid).each(&block)
+          sizes = EmailMessage.where(mailbox_id: mailbox_id, uid: slice).order(:uid).pluck(:uid, :size)
+          byte_bounded_batches(sizes).each do |batch|
+            EmailMessage.where(mailbox_id: mailbox_id, uid: batch).order(:uid).each(&block)
+          end
         end
+      end
+
+      # [[uid, size], ...] cut into uid lists of at most COPY_BATCH_BYTES
+      # each (a single larger message is a batch of its own).
+      def byte_bounded_batches(sizes)
+        batches = []
+        bytes = 0
+        sizes.each do |uid, size|
+          if batches.empty? || bytes + size.to_i > COPY_BATCH_BYTES
+            batches << []
+            bytes = 0
+          end
+          batches.last << uid
+          bytes += size.to_i
+        end
+        batches
       end
 
       # Resolves a mailbox by name for IMAP, treating Quarantine as

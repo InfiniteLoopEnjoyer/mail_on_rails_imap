@@ -101,6 +101,35 @@ class StarttlsTest < Minitest::Test
 
   # -- credentials are refused in the clear ----------------------------------
 
+  # Audit 2026-11-17: LOGIN in the clear was refused only once the whole
+  # command had been read - and a synchronizing literal is read by asking
+  # for it. "+ OK" solicited the password in cleartext, and only then came
+  # PRIVACYREQUIRED. The refusal now comes instead of the continuation.
+  test "a synchronizing literal in the clear is refused without being solicited" do
+    client = plaintext_session
+    client.gets("\r\n")
+    client.write("a1 LOGIN #{EMAIL} {#{PASSWORD.bytesize}}\r\n")
+
+    assert_equal "a1 NO [PRIVACYREQUIRED] STARTTLS required before sending literals\r\n", client.gets("\r\n")
+    # Nothing was waiting for the literal: the next line is a new command.
+    assert_match(/\Aa2 OK/, command(client, "a2", "NOOP"))
+
+    client.write("a3 LOGIN {#{EMAIL.bytesize}}\r\n")
+    assert_match(/\Aa3 NO \[PRIVACYREQUIRED\]/, client.gets("\r\n"))
+  end
+
+  test "after starttls the same literal login works" do
+    client = plaintext_session
+    client.gets("\r\n")
+    command(client, "a1", "STARTTLS")
+    tls = tls_connect(client)
+
+    tls.write("a2 LOGIN #{EMAIL} {#{PASSWORD.bytesize}}\r\n")
+    assert_match(/\A\+ /, tls.gets("\r\n"))
+    tls.write("#{PASSWORD}\r\n")
+    assert_match(/\Aa2 OK/, read_until_tagged(tls, "a2"))
+  end
+
   test "login in the clear is refused with privacyrequired" do
     client = plaintext_session
     client.gets("\r\n")

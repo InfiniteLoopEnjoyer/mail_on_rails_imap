@@ -143,4 +143,27 @@ class ImapBackendJunkFeedbackTest < MailOnRails::Testing::Database::TestCase
     MailOnRails::SenderRule.singleton_class.alias_method(:record!, :record_without_failure!)
     MailOnRails::SenderRule.singleton_class.remove_method(:record_without_failure!)
   end
+
+  # M6 (audit 2026-11-17): a canary session is read-only at the IMAP
+  # layer, and behind that the store's own writes into a honeypot account
+  # teach nothing - no sender rule, no learn job for the classifier that
+  # scores every real account's mail.
+  test "APPEND, COPY and MOVE across Junk in a honeypot account teach nothing" do
+    canary = MailOnRails::EmailAccount.create!(email: "canary@example.test", password: "a-long-test-password",
+                                               honeypot: true)
+    inbox = store.select_mailbox(canary.id, "INBOX")[:mailbox_id]
+    canary.junk_mailbox
+    enqueued.clear
+
+    appended = store.append(canary.id, "Junk", RAW, [], nil)[:uid]
+    uid = store.append(canary.id, "INBOX", RAW, [], nil)[:uid]
+    copied = store.copy(inbox, [ uid ], "Junk")
+    moved = store.move(inbox, [ uid ], "Junk")
+    junk = store.select_mailbox(canary.id, "Junk")[:mailbox_id]
+    rescued = store.move(junk, [ appended ], "INBOX")
+
+    [ copied, moved, rescued ].each { |result| assert_nil result[:error] }
+    assert_empty canary.sender_rules
+    assert_empty learn_classes
+  end
 end
